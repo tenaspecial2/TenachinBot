@@ -38,7 +38,7 @@ COMMISSION_PERCENTAGE = 10.0
 SUPPORT_PHONE_1 = "+251 90 834 3267"
 SUPPORT_PHONE_2 = "0967449552"
 SUPPORT_USERNAME = "@tenachinbottelemedicine"  
-WEBSITE_URL = "https://tena-specal.vercel.app/"
+WEBSITE_URL = "https://healthlink-gate-main.vercel.app/"
 
 # 🔗 CHANNELS & GROUPS LINKS
 FREE_CHANNEL_LINK = "https://t.me/tenachinfree"
