@@ -4,6 +4,7 @@ import os
 import sqlite3
 import uuid
 from dotenv import load_dotenv
+from services.supabase_service import init_supabase, record_transaction_supabase, send_notification_supabase
 
 load_dotenv()
 from aiogram import Bot, Dispatcher, F, Router
@@ -82,6 +83,7 @@ def init_db():
     conn.close()
 
 def record_transaction(doctor_name: str, item_type: str, item_title: str, price: float, user_id: int):
+    # Write to local SQLite (fallback)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -90,6 +92,8 @@ def record_transaction(doctor_name: str, item_type: str, item_title: str, price:
     ''', (doctor_name, item_type, item_title, price, user_id))
     conn.commit()
     conn.close()
+    # Write to Supabase (persistent, shared with website)
+    record_transaction_supabase(doctor_name, item_type, item_title, price, user_id)
 
 def get_doctor_name_by_id(doctor_id: int) -> str:
     for name, d_id in SPECIALISTS.items():
@@ -1139,6 +1143,7 @@ async def relay_messages(message: Message, bot: Bot):
 # 6. MAIN APPLICATION ENTRY
 async def main():
     init_db()
+    init_supabase()  # Connect to shared Supabase database
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
