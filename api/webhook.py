@@ -82,11 +82,29 @@ def sb_post(table: str, body: dict) -> dict:
         logger.error(f"Supabase POST error: {e}")
         return {}
 
+def sb_patch(table: str, query: str, body: dict) -> bool:
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{query}"
+    data = json.dumps(body).encode()
+    headers = {**sb_headers(), "Prefer": "return=minimal"}
+    req = Request(url, data=data, headers=headers, method="PATCH")
+    try:
+        with urlopen(req, timeout=8) as resp:
+            return resp.status in (200, 204)
+    except Exception as e:
+        logger.error(f"Supabase PATCH error: {e}")
+        return False
+
 # ── Bot Handlers ───────────────────────────────────────────────────
 
-def handle_start(chat_id: int, user: dict):
+def handle_start(chat_id: int, user: dict, payload: str = ""):
     name = user.get("first_name", "there")
     is_admin = user.get("id") in ADMIN_IDS
+
+    # Handle login token from website
+    if payload.startswith("login_"):
+        token = payload[6:]
+        handle_login_token(chat_id, user, token)
+        return
 
     text = (
         f"👋 Welcome to <b>Tena Special</b>, {name}!\n\n"
@@ -104,6 +122,32 @@ def handle_start(chat_id: int, user: dict):
         buttons.append([{"text": "⚙️ Admin Panel", "callback_data": "admin_panel"}])
 
     send_message(chat_id, text, reply_markup=inline_keyboard(buttons))
+
+
+def handle_login_token(chat_id: int, user: dict, token: str):
+    """Verify login token from website and update Supabase."""
+    telegram_id = str(user.get("id", ""))
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+    username = user.get("username", "")
+
+    updated = sb_patch(
+        "login_tokens",
+        f"token=eq.{token}&used=eq.false",
+        {
+            "telegram_id": telegram_id,
+            "telegram_name": name,
+            "telegram_username": username,
+        }
+    )
+
+    if updated:
+        send_message(
+            chat_id,
+            f"✅ <b>Login confirmed!</b>\n\nGo back to the website — you'll be logged in automatically, {name}! 🚀"
+        )
+    else:
+        send_message(chat_id, "❌ This login link has expired or already been used.\nPlease go back to the website and try again.")
+
 
 
 def handle_browse_doctors(chat_id: int):
@@ -164,7 +208,9 @@ def process_update(update: dict):
         text    = msg.get("text", "")
 
         if text.startswith("/start"):
-            handle_start(chat_id, user)
+            parts = text.split(" ", 1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            handle_start(chat_id, user, payload)
         elif text.startswith("/help"):
             handle_support(chat_id)
         else:
