@@ -106,6 +106,7 @@ MAIN_MENU = rk(
     ["👥 የቡድን ህክምና ምክክሮች"],
     ["🏠 የቤት ለቤት ህክምና & 🚨 ድንገተኛ አደጋ"],
     ["📞 እርዳታና ድጋፍ (Help)"],
+    ["💰 የምክክር ዋጋዬን ማስተካከያ"],  # shown to doctors only — harmless for patients
 )
 
 SPEC_SUB = ik(
@@ -156,11 +157,25 @@ def doctors_kb(dept: str):
     rows.append([btn("⬅️ ተመለስ", cb="back_to_depts")])
     return {"inline_keyboard": rows}
 
+def get_doctor_fees(doctor_id: int) -> dict:
+    """Fetch doctor's custom fees from Supabase, fallback to defaults."""
+    rows = sb_get("doctor_consultation_fees", f"telegram_id=eq.{doctor_id}&select=text_fee,voice_fee,video_fee")
+    if rows:
+        return {"text": rows[0].get("text_fee", 100), "voice": rows[0].get("voice_fee", 200), "video": rows[0].get("video_fee", 300)}
+    return {"text": 100, "voice": 200, "video": 300}
+
+def set_doctor_fees(doctor_id: int, text_fee, voice_fee, video_fee):
+    body = {"telegram_id": doctor_id, "text_fee": text_fee, "voice_fee": voice_fee, "video_fee": video_fee}
+    ok = sb_patch("doctor_consultation_fees", f"telegram_id=eq.{doctor_id}", body)
+    if not ok:
+        sb_post("doctor_consultation_fees", body)
+
 def call_type_kb(doctor_id, doctor_name):
+    fees = get_doctor_fees(doctor_id)
     return ik(
-        [btn("💬 Text Chat - 100 ETB",  cb=f"call_{doctor_id}_text_100_{doctor_name}")],
-        [btn("🎙️ Voice Call - 200 ETB", cb=f"call_{doctor_id}_voice_200_{doctor_name}")],
-        [btn("📹 Video Call - 300 ETB", cb=f"call_{doctor_id}_video_300_{doctor_name}")],
+        [btn(f"💬 Text Chat - {fees['text']} ETB",  cb=f"call_{doctor_id}_text_{fees['text']}_{doctor_name}")],
+        [btn(f"🎙️ Voice Call - {fees['voice']} ETB", cb=f"call_{doctor_id}_voice_{fees['voice']}_{doctor_name}")],
+        [btn(f"📹 Video Call - {fees['video']} ETB", cb=f"call_{doctor_id}_video_{fees['video']}_{doctor_name}")],
         [btn("⬅️ ተመለስ", cb="back_to_depts")],
     )
 
@@ -309,6 +324,25 @@ def get_doctor_name(doctor_id: int):
             return f"Dr. {name}"
     return f"Dr. Unknown ({doctor_id})"
 
+def handle_set_fees_start(chat_id: int, user: dict):
+    uid = user.get("id", 0)
+    if uid not in SPECIALISTS.values():
+        send(chat_id, "⛔ ይህ አገልግሎት ለስፔሻሊስት ሀኪሞች ብቻ ነው።")
+        return
+    fees = get_doctor_fees(uid)
+    send(chat_id,
+         f"💰 <b>የአሁኑ የምክክር ዋጋዎ</b>\n\n"
+         f"💬 Text Chat: <b>{fees['text']} ETB</b>\n"
+         f"🎙️ Voice Call: <b>{fees['voice']} ETB</b>\n"
+         f"📹 Video Call: <b>{fees['video']} ETB</b>\n\n"
+         "ዋጋዎን ለማስተካከል ከታች ይምረጡ:",
+         markup=ik(
+             [btn("💬 Text Chat ዋጋ ለመለወጥ",  cb="set_fee_text")],
+             [btn("🎙️ Voice Call ዋጋ ለመለወጥ", cb="set_fee_voice")],
+             [btn("📹 Video Call ዋጋ ለመለወጥ", cb="set_fee_video")],
+             [btn("⬅️ ወደ ሜኑ", cb="back_main")],
+         ))
+
 def handle_start(chat_id: int, user: dict, payload: str = ""):
     name = user.get("first_name", "there")
     if payload.startswith("login_"):
@@ -348,6 +382,7 @@ MENU_HANDLERS = {
         f"• ስልክ: <code>{SUPPORT_PHONE_1}</code> / <code>{SUPPORT_PHONE_2}</code>\n"
         f"• Telegram Admin: {SUPPORT_USERNAME}\n"
         f"• Website: {WEBSITE_URL}"),
+    "💰 የምክክር ዋጋዬን ማስተካከያ": lambda cid, user: handle_set_fees_start(cid, user),
 }
 
 # ── Callback handlers ──────────────────────────────────────────────
@@ -360,6 +395,17 @@ def handle_callback(cb: dict):
     uid     = user.get("id", 0)
 
     answer_cb(cb["id"])
+
+    # Set fee callbacks (for specialist doctors)
+    if data in ("set_fee_text", "set_fee_voice", "set_fee_video"):
+        if uid not in SPECIALISTS.values():
+            send(cid, "⛔ ይህ አገልግሎት ለስፔሻሊስቶች ብቻ ነው።")
+            return
+        fee_type = data.split("_")[2]  # text / voice / video
+        labels = {"text": "Text Chat", "voice": "Voice Call", "video": "Video Call"}
+        set_state(uid, f"setting_fee_{fee_type}", {})
+        send(cid, f"💰 <b>አዲስ {labels[fee_type]} ዋጋ ያስገቡ (ETB):</b>\n\nምሳሌ: 150")
+        return
 
     # Navigation
     if data == "back_main":
@@ -683,6 +729,29 @@ def handle_message(msg: dict):
             (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
         clear_state(uid)
         send(cid, "✅ ደረሰኝዎ ለአድሚን ተልኳል! ቻናሉ ሊንክ ይደርስዎታል።")
+        return
+
+    # ── Doctor sets their own consultation fee ───────────────────────
+    if state and state.startswith("setting_fee_") and text:
+        fee_type = state.split("_")[2]  # text / voice / video
+        try:
+            new_fee = float(text.replace(" ETB", "").replace(",", "").strip())
+            if new_fee <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            send(cid, "❌ ትክክለኛ ቁጥር ያስገቡ (ምሳሌ: 150)")
+            return
+        fees = get_doctor_fees(uid)
+        fees[fee_type] = new_fee
+        set_doctor_fees(uid, fees["text"], fees["voice"], fees["video"])
+        clear_state(uid)
+        labels = {"text": "Text Chat", "voice": "Voice Call", "video": "Video Call"}
+        send(cid,
+             f"✅ <b>{labels[fee_type]} ዋጋ ወደ {new_fee} ETB ተቀይሯል!</b>\n\n"
+             f"💬 Text Chat: <b>{fees['text']} ETB</b>\n"
+             f"🎙️ Voice Call: <b>{fees['voice']} ETB</b>\n"
+             f"📹 Video Call: <b>{fees['video']} ETB</b>",
+             markup=MAIN_MENU)
         return
 
     # ── Doctor registration multi-step ───────────────────────────────
