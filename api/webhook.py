@@ -1,145 +1,224 @@
-import sys
-import os
+"""
+Standalone Vercel webhook handler for Tena Special Bot.
+Uses Telegram Bot API directly via HTTP (no aiogram dependency chain).
+Uses Supabase for data persistence.
+"""
 import json
-import asyncio
+import os
+import hashlib
+import hmac
 import logging
 from http.server import BaseHTTPRequestHandler
-
-# Add parent directory to path so we can import from main.py
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from aiogram import Bot, Dispatcher
-from aiogram.types import Update
-from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
-from supabase import create_client
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode
+from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Supabase FSM Storage (replaces MemoryStorage)
-# ──────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "501384766,5872954068").split(",")]
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY", "")
+WEBSITE_URL    = "https://healthlink-gate-main-nine.vercel.app/"
+SUPPORT_PHONE  = "+251 90 834 3267"
+FREE_CHANNEL   = "https://t.me/tenachinfree"
+PREMIUM_CHANNEL= "https://t.me/tenachinpremium"
 
-class SupabaseStorage(BaseStorage):
-    """Persistent FSM storage backed by Supabase."""
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-    def __init__(self):
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_KEY")
-        self._client = create_client(url, key) if url and key else None
+# ── Telegram API helpers ───────────────────────────────────────────
 
-    def _row_id(self, key: StorageKey) -> dict:
-        return {"chat_id": str(key.chat_id), "user_id": str(key.user_id)}
-
-    def _get_row(self, key: StorageKey):
-        if not self._client:
-            return None
-        try:
-            res = self._client.table("bot_fsm_states") \
-                .select("*") \
-                .eq("chat_id", str(key.chat_id)) \
-                .eq("user_id", str(key.user_id)) \
-                .maybeSingle() \
-                .execute()
-            return res.data
-        except Exception as e:
-            logger.error(f"SupabaseStorage get error: {e}")
-            return None
-
-    def _upsert_row(self, key: StorageKey, state: str = None, data: dict = None):
-        if not self._client:
-            return
-        try:
-            row = {
-                "chat_id": str(key.chat_id),
-                "user_id": str(key.user_id),
-                "state": state,
-                "data": json.dumps(data or {}),
-            }
-            self._client.table("bot_fsm_states").upsert(row).execute()
-        except Exception as e:
-            logger.error(f"SupabaseStorage upsert error: {e}")
-
-    async def set_state(self, key: StorageKey, state: StateType = None):
-        row = self._get_row(key)
-        existing_data = json.loads(row["data"]) if row and row.get("data") else {}
-        state_str = state.state if hasattr(state, "state") else state
-        self._upsert_row(key, state=state_str, data=existing_data)
-
-    async def get_state(self, key: StorageKey) -> str | None:
-        row = self._get_row(key)
-        return row["state"] if row else None
-
-    async def set_data(self, key: StorageKey, data: dict):
-        row = self._get_row(key)
-        existing_state = row["state"] if row else None
-        self._upsert_row(key, state=existing_state, data=data)
-
-    async def get_data(self, key: StorageKey) -> dict:
-        row = self._get_row(key)
-        if row and row.get("data"):
-            try:
-                return json.loads(row["data"])
-            except Exception:
-                pass
+def tg_post(method: str, payload: dict) -> dict:
+    url = f"{TG_API}/{method}"
+    data = json.dumps(payload).encode()
+    req = Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read())
+    except URLError as e:
+        logger.error(f"Telegram API error: {e}")
         return {}
 
-    async def close(self):
-        pass
+def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_post("sendMessage", payload)
+
+def answer_callback(callback_id: str, text: str = ""):
+    tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+def inline_keyboard(rows: list[list[dict]]) -> dict:
+    return {"inline_keyboard": rows}
+
+# ── Supabase helpers ───────────────────────────────────────────────
+
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def sb_get(table: str, params: str) -> list:
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{params}"
+    req = Request(url, headers=sb_headers())
+    try:
+        with urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        logger.error(f"Supabase GET error: {e}")
+        return []
+
+def sb_post(table: str, body: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    data = json.dumps(body).encode()
+    req = Request(url, data=data, headers={**sb_headers(), "Prefer": "return=representation"})
+    try:
+        with urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        logger.error(f"Supabase POST error: {e}")
+        return {}
+
+# ── Bot Handlers ───────────────────────────────────────────────────
+
+def handle_start(chat_id: int, user: dict):
+    name = user.get("first_name", "there")
+    is_admin = user.get("id") in ADMIN_IDS
+
+    text = (
+        f"👋 Welcome to <b>Tena Special</b>, {name}!\n\n"
+        "🏥 Connect with verified specialist doctors for private online consultations.\n\n"
+        f"🌐 <a href='{WEBSITE_URL}'>Visit our website</a>"
+    )
+
+    buttons = [
+        [{"text": "🌐 Open Website", "web_app": {"url": WEBSITE_URL}}],
+        [{"text": "👨‍⚕️ Browse Doctors", "callback_data": "browse_doctors"}],
+        [{"text": "📋 My Consultations", "callback_data": "my_consultations"}],
+        [{"text": "📞 Support", "callback_data": "support"}],
+    ]
+    if is_admin:
+        buttons.append([{"text": "⚙️ Admin Panel", "callback_data": "admin_panel"}])
+
+    send_message(chat_id, text, reply_markup=inline_keyboard(buttons))
 
 
-# ──────────────────────────────────────────────
-# Bot & Dispatcher factory
-# ──────────────────────────────────────────────
-
-async def process_telegram_update(body: bytes):
-    from main import router, BOT_TOKEN
-    from services.supabase_service import init_supabase
-
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set")
+def handle_browse_doctors(chat_id: int):
+    doctors = sb_get("public_doctor_profiles", "select=full_name,specialty,consultation_fee&is_verified=eq.true")
+    if not doctors:
+        send_message(chat_id, "No verified doctors available yet. Check back soon!")
         return
 
-    init_supabase()
+    text = "👨‍⚕️ <b>Available Doctors</b>\n\n"
+    buttons = []
+    for doc in doctors[:8]:
+        name = doc.get("full_name", "Unknown")
+        spec = doc.get("specialty", "General")
+        fee  = doc.get("consultation_fee", "N/A")
+        text += f"• <b>{name}</b> — {spec} ({fee} ETB)\n"
+        buttons.append([{"text": f"🩺 {name}", "callback_data": f"doctor_{name}"}])
 
-    bot = Bot(token=BOT_TOKEN)
-    storage = SupabaseStorage()
-    dp = Dispatcher(storage=storage)
-    dp.include_router(router)
-
-    update_data = json.loads(body)
-    update = Update(**update_data)
-
-    try:
-        await dp.process_update(update)
-    finally:
-        await bot.session.close()
+    buttons.append([{"text": "⬅️ Back", "callback_data": "back_main"}])
+    send_message(chat_id, text, reply_markup=inline_keyboard(buttons))
 
 
-# ──────────────────────────────────────────────
-# Vercel Serverless Handler
-# ──────────────────────────────────────────────
+def handle_support(chat_id: int):
+    text = (
+        "📞 <b>Support</b>\n\n"
+        f"Phone: {SUPPORT_PHONE}\n"
+        f"Free Channel: {FREE_CHANNEL}\n"
+        f"Premium Channel: {PREMIUM_CHANNEL}"
+    )
+    buttons = [[{"text": "⬅️ Back", "callback_data": "back_main"}]]
+    send_message(chat_id, text, reply_markup=inline_keyboard(buttons))
+
+
+def handle_admin_panel(chat_id: int, user_id: int):
+    if user_id not in ADMIN_IDS:
+        send_message(chat_id, "⛔ Access denied.")
+        return
+    text = "⚙️ <b>Admin Panel</b>\n\nManage the platform:"
+    buttons = [
+        [{"text": "📊 View Consultations", "callback_data": "admin_consultations"}],
+        [{"text": "👨‍⚕️ Manage Doctors", "callback_data": "admin_doctors"}],
+        [{"text": "⬅️ Back", "callback_data": "back_main"}],
+    ]
+    send_message(chat_id, text, reply_markup=inline_keyboard(buttons))
+
+
+def handle_back_main(chat_id: int, user: dict):
+    handle_start(chat_id, user)
+
+
+# ── Update Router ──────────────────────────────────────────────────
+
+def process_update(update: dict):
+    # Handle messages
+    if "message" in update:
+        msg     = update["message"]
+        chat_id = msg["chat"]["id"]
+        user    = msg.get("from", {})
+        text    = msg.get("text", "")
+
+        if text.startswith("/start"):
+            handle_start(chat_id, user)
+        elif text.startswith("/help"):
+            handle_support(chat_id)
+        else:
+            send_message(chat_id, "Use the menu below 👇", reply_markup=inline_keyboard([
+                [{"text": "🏠 Main Menu", "callback_data": "back_main"}]
+            ]))
+
+    # Handle callback queries
+    elif "callback_query" in update:
+        cb      = update["callback_query"]
+        chat_id = cb["message"]["chat"]["id"]
+        user    = cb.get("from", {})
+        data    = cb.get("data", "")
+
+        answer_callback(cb["id"])
+
+        if data == "browse_doctors":
+            handle_browse_doctors(chat_id)
+        elif data == "support":
+            handle_support(chat_id)
+        elif data == "admin_panel":
+            handle_admin_panel(chat_id, user.get("id", 0))
+        elif data == "back_main":
+            handle_back_main(chat_id, user)
+        elif data == "my_consultations":
+            send_message(chat_id, f"📋 View your consultations on our website:\n{WEBSITE_URL}")
+        else:
+            send_message(chat_id, "Coming soon! 🚧")
+
+
+# ── Vercel Handler ─────────────────────────────────────────────────
 
 class handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # suppress default logging
+        pass
 
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Tenachin Bot webhook is active.")
+        self.wfile.write(b"Tena Special Bot is active.")
 
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            asyncio.run(process_telegram_update(body))
+            body   = self.rfile.read(length)
+            update = json.loads(body)
+            process_update(update)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
         except Exception as e:
             logger.error(f"Webhook error: {e}")
-            self.send_response(500)
+            self.send_response(200)  # Always return 200 to Telegram
             self.end_headers()
             self.wfile.write(b'{"ok":false}')
