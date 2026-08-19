@@ -790,12 +790,59 @@ def handle_callback(cb: dict):
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>APPROVED</b>")
 
     elif data.startswith("appr_s_"):
+        # Format: appr_s_{pat_id}_{pid}_{price} or appr_s_{pat_id}_{price}
         parts  = data.split("_")
         pat_id = int(parts[2])
-        price  = float(parts[3]) if len(parts) > 3 else 0.0
-        record_transaction(0, "Platform", "Digital Product", "E-Book", price, pat_id)
-        send(pat_id, "🎉 <b>ክፍያዎ ጸድቋል!</b> ምርትዎ/ፋይሉ ቶሎ ይደርስዎታል!")
-        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>STORE APPROVED</b>")
+        pid    = parts[3] if len(parts) > 3 and not parts[3].isdigit() else (parts[3] if len(parts) > 4 else "")
+        price  = float(parts[-1]) if parts[-1].replace(".","").isdigit() else 0.0
+
+        # Look up product in bot_products
+        title = "የጤና ትምህርት መጽሐፍ"
+        dl_url = ""
+        ftype = "pdf"
+        if pid:
+            prods = sb_get("bot_products", f"id=ilike.{pid}%&select=title,download_url,file_type,price")
+            if prods and isinstance(prods, list) and len(prods) > 0:
+                title  = prods[0].get("title", title)
+                dl_url = prods[0].get("download_url", "")
+                ftype  = prods[0].get("file_type", "pdf")
+                price  = float(prods[0].get("price", price))
+
+        record_transaction(0, "Platform", "Digital Product", title, price, pat_id)
+
+        # Automatic Delivery to the buyer on Telegram
+        delivered = False
+        if dl_url:
+            try:
+                method = "sendVideo" if ftype == "video" else "sendDocument"
+                param_key = "video" if ftype == "video" else "document"
+                caption = f"📖 <b>{title}</b>\n\nክፍያዎ ስለጸደቀ መጽሐፉ/ትምህርቱ ተልኮልዎታል! መልካም ንባብ።"
+                res = tg(method, {
+                    "chat_id": pat_id,
+                    param_key: dl_url,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                })
+                if res.get("ok"):
+                    delivered = True
+            except Exception as e:
+                logger.error(f"Auto deliver error: {e}")
+
+        if delivered:
+            send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b> መጽሐፉ ከላይ ተልኮልዎታል!")
+        else:
+            if dl_url and dl_url.startswith("http"):
+                send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n\n📖 <b>{title}</b>\n🔗 ማውረጃ ሊንክ፦ {dl_url}")
+            else:
+                send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n\n📖 <b>{title}</b>\nመጽሐፉ በቅርቡ በአድሚን ቡድን ይላክልዎታል። እናመሰግናለን!")
+                grp = get_admin_group()
+                if grp:
+                    send(grp, f"ℹ️ <b>ማስታወሻ:</b> ለታካሚ (<code>{pat_id}</code>) መጽሐፉን (<b>{title}</b>) ይላኩላቸው።")
+
+        try:
+            edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>STORE APPROVED & DELIVERED</b>")
+        except Exception:
+            send(cid, f"✅ Store payment for {pat_id} APPROVED!")
 
     elif data.startswith("appr_p_"):
         pat_id = int(data.split("_")[2])
@@ -859,6 +906,12 @@ def handle_message(msg: dict):
 
     if text.startswith("/help"):
         send(cid, f"📞 {cfg('support_phone_1','+251908343267')}\nTelegram: {cfg('support_username','')}")
+        return
+
+    if doc and ((msg.get("caption") or "").startswith("/getfileid") or (msg.get("caption") or "").startswith("/fileid")):
+        fid = doc.get("file_id")
+        fname = doc.get("file_name", "Document")
+        send(cid, f"📄 <b>Telegram File ID ({fname}):</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this into the Admin Panel for automatic book delivery!</i>")
         return
 
     for key, fn in MENU_HANDLERS.items():
