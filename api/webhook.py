@@ -75,12 +75,27 @@ def fwd_doc(chat_id, file_id, caption, markup=None):
 def copy_msg(to_id, from_id, msg_id):
     tg("copyMessage", {"chat_id": to_id, "from_chat_id": from_id, "message_id": msg_id})
 
-def notify_admin(file_id: str, caption: str, markup, is_photo: bool):
-    """Forward a receipt/notification to the admin group."""
+def notify_admin(file_id: str, caption: str, markup, is_photo: bool) -> bool:
+    """Forward a receipt/notification to the admin group. Returns True on success."""
     if not ADMIN_GROUP:
-        logger.warning("ADMIN_GROUP_ID not set in environment variables.")
-        return
-    (fwd_photo if is_photo else fwd_doc)(ADMIN_GROUP, file_id, caption, markup=markup)
+        logger.error("ADMIN_GROUP_ID is 0 or not set in environment variables.")
+        return False
+    try:
+        (fwd_photo if is_photo else fwd_doc)(ADMIN_GROUP, file_id, caption, markup=markup)
+        return True
+    except Exception as e:
+        logger.error(f"notify_admin failed (group={ADMIN_GROUP}): {e}")
+        # Fallback: send plain text alert to group
+        try:
+            tg("sendMessage", {
+                "chat_id": ADMIN_GROUP,
+                "text": f"⚠️ Failed to forward media. Details:\n\n{caption}\n\n(Attach file manually)",
+                "parse_mode": "HTML",
+                "reply_markup": markup,
+            })
+        except Exception as e2:
+            logger.error(f"notify_admin text fallback also failed: {e2}")
+        return False
 
 # ── Keyboards ─────────────────────────────────────────────────────
 
@@ -753,6 +768,31 @@ def handle_message(msg: dict):
              f"📞 ስልክ: <code>{SUPPORT_PHONE_1}</code>\n"
              f"Telegram: {SUPPORT_USERNAME}")
         return
+
+    if text.startswith("/debug"):
+        # Only works if the user is in the admin group or messages the bot directly
+        send(cid,
+             f"🔧 <b>Bot Debug Info</b>\n\n"
+             f"• <b>ADMIN_GROUP_ID:</b> <code>{ADMIN_GROUP}</code>\n"
+             f"• <b>Your chat ID:</b> <code>{cid}</code>\n"
+             f"• <b>Your user ID:</b> <code>{uid}</code>\n"
+             f"• <b>BOT_TOKEN set:</b> {'✅' if BOT_TOKEN else '❌'}\n"
+             f"• <b>SUPABASE_URL set:</b> {'✅' if SUPABASE_URL else '❌'}\n\n"
+             "To test group send, add me to the group and send /testgroup")
+        return
+
+    if text.startswith("/testgroup"):
+        result = tg("sendMessage", {
+            "chat_id": ADMIN_GROUP,
+            "text": f"✅ Test message from bot. Group ID <code>{ADMIN_GROUP}</code> works!",
+            "parse_mode": "HTML"
+        })
+        if result.get("ok"):
+            send(cid, "✅ Test message sent to admin group successfully!")
+        else:
+            send(cid, f"❌ Failed to send to group.\n\nError: {result}\n\nCheck:\n1. Bot is added to the group\n2. Bot is made admin in the group\n3. ADMIN_GROUP_ID is correct (negative number)")
+        return
+
 
     for key, fn in MENU_HANDLERS.items():
         if text == key:
