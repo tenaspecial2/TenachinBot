@@ -486,9 +486,45 @@ def get_doctor_earnings(tid: int) -> dict:
 
 # ── Admin Group Command Handler ───────────────────────────────────
 
-def handle_group_command(text: str, chat_id: int, user: dict):
+def handle_group_command(text: str, chat_id: int, user: dict, msg: dict = None):
     uid = user.get("id", 0)
     rm_kb = {"remove_keyboard": True}
+
+    if text.startswith("/getfileid") or text.startswith("/getfileid@") or text.startswith("/fileid"):
+        reply_to = (msg or {}).get("reply_to_message")
+        if reply_to:
+            r_doc   = reply_to.get("document")
+            r_video = reply_to.get("video")
+            r_photo = reply_to.get("photo")
+            if r_doc:
+                fid   = r_doc.get("file_id")
+                fname = r_doc.get("file_name", "Document")
+                send(chat_id, f"📄 <b>Telegram File ID ({fname}):</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this File ID into the Admin Panel!</i>", markup=rm_kb)
+                return
+            elif r_video:
+                fid = r_video.get("file_id")
+                send(chat_id, f"🎬 <b>Telegram Video File ID:</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this File ID into the Admin Panel!</i>", markup=rm_kb)
+                return
+            elif r_photo:
+                fid = r_photo[-1].get("file_id")
+                send(chat_id, f"🖼️ <b>Telegram Photo File ID:</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this File ID into the Admin Panel!</i>", markup=rm_kb)
+                return
+
+        # Check if current message itself has document/photo
+        c_doc = (msg or {}).get("document")
+        if c_doc:
+            fid   = c_doc.get("file_id")
+            fname = c_doc.get("file_name", "Document")
+            send(chat_id, f"📄 <b>Telegram File ID ({fname}):</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this File ID into the Admin Panel!</i>", markup=rm_kb)
+            return
+
+        send(chat_id,
+             "💡 <b>To get a File ID:</b>\n\n"
+             "1. <b>Reply</b> directly to any uploaded PDF/Document with <code>/getfileid</code>\n"
+             "2. OR send the file with <code>/getfileid</code> in the caption\n"
+             "3. OR send the PDF directly to the bot in private chat!",
+             markup=rm_kb)
+        return
 
     if text.startswith("/getgroupid") or text.startswith("/getgroupid@"):
         send(chat_id,
@@ -894,8 +930,13 @@ def handle_message(msg: dict):
 
     # ── GROUP & SUPERGROUP: only handle slash commands ──────────────
     if chat_type in ("group", "supergroup"):
+        if doc and ((msg.get("caption") or "").startswith("/getfileid") or (msg.get("caption") or "").startswith("/fileid")):
+            fid   = doc.get("file_id")
+            fname = doc.get("file_name", "Document")
+            send(cid, f"📄 <b>Telegram File ID ({fname}):</b>\n\n<code>{fid}</code>\n\n<i>Copy and paste this into the Admin Panel!</i>", markup={"remove_keyboard": True})
+            return
         if text and text.startswith("/"):
-            handle_group_command(text, cid, user)
+            handle_group_command(text, cid, user, msg)
         return
 
     # ── PRIVATE CHAT: commands & menu ──────────────────────────────
