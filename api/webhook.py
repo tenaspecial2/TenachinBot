@@ -1,10 +1,9 @@
 """
-Tena Special Bot — Fully Configurable Vercel Webhook Handler
-- All settings stored in Supabase bot_settings table (no hardcoded values)
-- Admin group notifications with Approve/Reject buttons
-- Dynamic doctor loading from public_doctor_profiles view
-- Proper group vs private chat handling
-- Admin commands: /settings, /set, /getgroupid, /testgroup
+Tena Special Bot — Vercel Webhook Handler
+- ADMIN_GROUP_ID env var is the primary source (set in Vercel)
+- Supabase bot_settings override if the table exists
+- Group chat: no reply keyboards, only inline buttons for receipts
+- Full admin commands: /settings /set /getgroupid /testgroup
 """
 import json
 import os
@@ -14,58 +13,67 @@ from urllib.request import urlopen, Request
 
 logger = logging.getLogger(__name__)
 
-# ── Minimal env config (only secrets stay here) ───────────────────
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-COMMISSION_PCT = float(os.getenv("COMMISSION_PCT", "10"))
+# ── ENV VARS (primary, always works) ──────────────────────────────
+BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
+SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_KEY", "")
+# Admin group ID — set this in Vercel env vars as ADMIN_GROUP_ID
+ADMIN_GROUP_ENV = int(os.getenv("ADMIN_GROUP_ID", "0"))
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ── Settings cache ─────────────────────────────────────────────────
+# ── Settings (Supabase overrides env if bot_settings table exists) ─
 _settings_cache: dict = {}
+_settings_loaded = False
 
 def _sb_headers():
     return {
-        "apikey": SUPABASE_KEY,
+        "apikey":        SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type":  "application/json",
     }
 
 def _load_settings():
-    """Load all bot_settings from Supabase into cache."""
-    global _settings_cache
+    global _settings_cache, _settings_loaded
+    if _settings_loaded:
+        return
     try:
         url = f"{SUPABASE_URL}/rest/v1/bot_settings?select=key,value"
         req = Request(url, headers=_sb_headers())
-        with urlopen(req, timeout=8) as r:
+        with urlopen(req, timeout=5) as r:
             rows = json.loads(r.read())
-        _settings_cache = {row["key"]: row["value"] for row in rows}
+        _settings_cache  = {row["key"]: row["value"] for row in rows if isinstance(row, dict)}
+        _settings_loaded = True
     except Exception as e:
-        logger.error(f"_load_settings failed: {e}")
+        logger.warning(f"bot_settings not loaded (using env vars): {e}")
+        _settings_loaded = True  # Don't retry on every request
 
 def cfg(key: str, fallback: str = "") -> str:
-    """Get a setting value (loads from cache, refreshes if missing)."""
-    if not _settings_cache:
-        _load_settings()
+    _load_settings()
     return _settings_cache.get(key, fallback)
 
 def cfg_int(key: str, fallback: int = 0) -> int:
     try:
-        return int(cfg(key, str(fallback)))
+        v = cfg(key, "")
+        return int(v) if v else fallback
     except ValueError:
         return fallback
 
 def cfg_float(key: str, fallback: float = 0.0) -> float:
     try:
-        return float(cfg(key, str(fallback)))
+        v = cfg(key, "")
+        return float(v) if v else fallback
     except ValueError:
         return fallback
 
+def get_admin_group() -> int:
+    """Returns admin group ID — Supabase setting takes priority, then env var."""
+    from_db = cfg_int("admin_group_id", 0)
+    return from_db if from_db else ADMIN_GROUP_ENV
+
 def set_cfg(key: str, value: str) -> bool:
-    """Update or insert a setting."""
-    _settings_cache[key] = value  # update local cache immediately
-    body = json.dumps({"key": key, "value": value, "updated_at": "now()"}).encode()
+    _settings_cache[key] = value
+    body = json.dumps({"key": key, "value": value}).encode()
     url  = f"{SUPABASE_URL}/rest/v1/bot_settings?key=eq.{key}"
     req  = Request(url, data=body,
                    headers={**_sb_headers(), "Prefer": "return=minimal"},
@@ -74,10 +82,11 @@ def set_cfg(key: str, value: str) -> bool:
         with urlopen(req, timeout=8) as r:
             if r.status in (200, 204):
                 return True
-        # Row doesn't exist yet — INSERT
+        # Row not found — insert
         url2 = f"{SUPABASE_URL}/rest/v1/bot_settings"
-        req2 = Request(url2, data=body,
-                       headers={**_sb_headers(), "Prefer": "return=minimal"})
+        body2 = json.dumps({"key": key, "value": value, "description": ""}).encode()
+        req2  = Request(url2, data=body2,
+                        headers={**_sb_headers(), "Prefer": "return=minimal"})
         with urlopen(req2, timeout=8):
             return True
     except Exception as e:
@@ -85,13 +94,19 @@ def set_cfg(key: str, value: str) -> bool:
         return False
 
 def all_settings_text() -> str:
-    """Return all settings as a readable text block."""
-    if not _settings_cache:
-        _load_settings()
-    lines = ["⚙️ <b>Bot Settings</b>\n"]
+    _load_settings()
+    grp = get_admin_group()
+    lines = [
+        "⚙️ <b>Bot Settings</b>\n",
+        f"• <b>admin_group_id (env):</b> <code>{ADMIN_GROUP_ENV}</code>",
+        f"• <b>admin_group_id (db):</b>  <code>{cfg_int('admin_group_id', 0)}</code>",
+        f"• <b>Active group ID:</b>       <code>{grp}</code>\n",
+    ]
     for k, v in sorted(_settings_cache.items()):
         lines.append(f"• <b>{k}</b>: <code>{v}</code>")
-    lines.append("\n<i>To update: /set key value</i>\n<i>Example: /set cbe_account 1000123456789</i>")
+    if not _settings_cache:
+        lines.append("<i>(bot_settings table empty or not found — using env vars)</i>")
+    lines.append("\n<i>Update: /set key value</i>")
     return "\n".join(lines)
 
 # ── Telegram API ───────────────────────────────────────────────────
@@ -147,31 +162,36 @@ def copy_msg(to_id, from_id, msg_id):
                         "from_chat_id": from_id, "message_id": msg_id})
 
 def notify_admin(file_id: str, caption: str, markup, is_photo: bool) -> bool:
-    """Forward receipt to admin group. Always safe — never crashes the handler."""
-    group_id = cfg_int("admin_group_id", 0)
+    """Send receipt to the admin group. Never crashes the handler."""
+    group_id = get_admin_group()
     if not group_id:
-        logger.error("admin_group_id not configured in bot_settings.")
+        logger.error(
+            "Admin group ID is 0. Set ADMIN_GROUP_ID in Vercel env vars "
+            "OR /set admin_group_id in the bot_settings table.")
         return False
     try:
         result = (fwd_photo if is_photo else fwd_doc)(group_id, file_id, caption, markup=markup)
-        return result.get("ok", False)
+        if result.get("ok"):
+            return True
+        logger.error(f"notify_admin TG error: {result}")
     except Exception as e:
-        logger.error(f"notify_admin photo/doc failed: {e}")
-        # Fallback: plain text with approve/reject buttons
-        try:
-            tg("sendMessage", {
-                "chat_id": group_id,
-                "text": f"⚠️ <b>ፎቶ መላክ አልተቻለም — Manual Review:</b>\n\n{caption}",
-                "parse_mode": "HTML",
-                "reply_markup": markup,
-            })
-        except Exception as e2:
-            logger.error(f"notify_admin text fallback failed: {e2}")
-        return False
+        logger.error(f"notify_admin exception: {e}")
+    # Fallback: try plain text message
+    try:
+        tg("sendMessage", {
+            "chat_id": group_id,
+            "text": f"⚠️ <b>Failed to forward media — Manual Review Needed:</b>\n\n{caption}",
+            "parse_mode": "HTML",
+            "reply_markup": markup,
+        })
+    except Exception as e2:
+        logger.error(f"notify_admin text fallback failed: {e2}")
+    return False
 
 # ── Keyboards ─────────────────────────────────────────────────────
 
 def rk(*rows):
+    """Reply keyboard — only for PRIVATE chats."""
     return {"keyboard": [[{"text": t} for t in row] for row in rows],
             "resize_keyboard": True}
 
@@ -210,13 +230,12 @@ SPECIALTIES_KB = ik(
 
 def edu_menu():
     return ik(
-        [btn("🎁 ነፃ የጤና ትምህርቶች",          url=cfg("free_channel", "https://t.me/tenachinfree"))],
-        [btn(f"💎 ፕሪሚየም ቻናል ({cfg('premium_price','24')} ETB/ወር)",
-             cb="buy_premium_channel")],
-        [btn("🩺 የውስጥ ደዌ መጻሕፍት",          cb="store_dept_internal")],
-        [btn("🤰 የማህፀን መጻሕፍት (OBGYN)",     cb="store_dept_obgyn")],
-        [btn("👶 የሕፃናት ህክምና",              cb="store_dept_peds")],
-        [btn("⬅️ ተመለስ",                     cb="back_main")],
+        [btn("🎁 ነፃ የጤና ትምህርቶች", url=cfg("free_channel", "https://t.me/tenachinfree"))],
+        [btn(f"💎 ፕሪሚየም ቻናል ({cfg('premium_price','24')} ETB/ወር)", cb="buy_premium_channel")],
+        [btn("🩺 የውስጥ ደዌ መጻሕፍት",      cb="store_dept_internal")],
+        [btn("🤰 የማህፀን መጻሕፍት (OBGYN)", cb="store_dept_obgyn")],
+        [btn("👶 የሕፃናት ህክምና",           cb="store_dept_peds")],
+        [btn("⬅️ ተመለስ",                  cb="back_main")],
     )
 
 def group_menu():
@@ -232,20 +251,20 @@ HOMECARE_MENU = ik(
     [btn("⬅️ ተመለስ",                  cb="back_main")],
 )
 
-def payment_text(price, doctor_name=""):
-    cbe  = cfg("cbe_account", "N/A")
-    tel  = cfg("telebirr_account", "N/A")
-    name = cfg("account_holder", "")
-    lines = [f"💳 <b>ክፍያ: {price} ETB</b>\n\n"]
+def payment_text(price, doctor_name="") -> str:
+    cbe  = cfg("cbe_account",      "1000255631865")
+    tel  = cfg("telebirr_account", "0908343267")
+    name = cfg("account_holder",   "")
+    t = []
     if doctor_name:
-        lines.append(f"ለ <b>{doctor_name}</b>\n\n")
-    lines.append("ክፍያ ቦታ፦\n")
-    lines.append(f"• <b>CBE:</b> <code>{cbe}</code>")
+        t.append(f"ለ <b>{doctor_name}</b>\n")
+    t.append(f"💳 <b>ክፍያ: {price} ETB</b>\n\nክፍያ ቦታ፦\n")
+    t.append(f"• <b>CBE:</b> <code>{cbe}</code>")
     if name:
-        lines.append(f" ({name})")
-    lines.append(f"\n• <b>Telebirr:</b> <code>{tel}</code>\n\n")
-    lines.append("<b>ክፍያ ከፈጸሙ በኋላ ደረሰኙን (Screenshot) ይላኩ፦</b>")
-    return "".join(lines)
+        t.append(f" ({name})")
+    t.append(f"\n• <b>Telebirr:</b> <code>{tel}</code>\n\n")
+    t.append("<b>ደረሰኙን (Screenshot) ይላኩ፦</b>")
+    return "".join(t)
 
 def digital_products_kb(dept):
     if dept == "internal":
@@ -330,6 +349,50 @@ def sb_delete(table, query):
         logger.error(f"sb_delete {table}: {e}")
         return False
 
+# ── FSM helpers ────────────────────────────────────────────────────
+
+def get_state(uid: int) -> dict:
+    rows = sb_get("bot_fsm_states", f"user_id=eq.{uid}&select=state,data")
+    if rows:
+        return {"state": rows[0].get("state", ""),
+                "data":  rows[0].get("data") or {}}
+    return {"state": "", "data": {}}
+
+def set_state(uid: int, state: str, data: dict = None):
+    body = {"user_id": uid, "state": state, "data": data or {}}
+    # Try upsert via POST with ON CONFLICT header
+    url = f"{SUPABASE_URL}/rest/v1/bot_fsm_states"
+    d   = json.dumps(body).encode()
+    req = Request(url, data=d,
+                  headers={**_sb_headers(),
+                            "Prefer": "resolution=merge-duplicates,return=minimal"})
+    try:
+        with urlopen(req, timeout=8):
+            return
+    except Exception as e:
+        logger.error(f"set_state upsert failed: {e}")
+        # Try PATCH fallback
+        try:
+            sb_patch("bot_fsm_states", f"user_id=eq.{uid}", body)
+        except Exception as e2:
+            logger.error(f"set_state PATCH fallback failed: {e2}")
+
+def clear_state(uid: int):
+    sb_delete("bot_fsm_states", f"user_id=eq.{uid}")
+
+def update_state_data(uid: int, extra: dict):
+    s = get_state(uid)
+    s["data"].update(extra)
+    set_state(uid, s["state"], s["data"])
+
+def start_session(patient_id: int, doctor_id: int, call_type: str):
+    set_state(patient_id, "in_session", {"partner_id": doctor_id, "call_type": call_type})
+    set_state(doctor_id,  "in_session", {"partner_id": patient_id, "call_type": call_type})
+
+def end_session_state(uid: int, partner_id: int):
+    clear_state(uid)
+    clear_state(partner_id)
+
 # ── Dynamic doctor helpers ─────────────────────────────────────────
 
 def get_doctors_list(dept: str = "") -> list:
@@ -381,8 +444,6 @@ def doctors_kb(dept: str):
     rows.append([btn("⬅️ ተመለስ", cb="back_to_depts")])
     return {"inline_keyboard": rows}
 
-# ── Doctor fee helpers ─────────────────────────────────────────────
-
 def get_doctor_fees(tid: int) -> dict:
     rows = sb_get("doctor_consultation_fees",
                   f"telegram_id=eq.{tid}&select=text_fee,voice_fee,video_fee")
@@ -418,8 +479,6 @@ def call_type_kb(doctor_id, doctor_name):
         [btn("⬅️ ተመለስ", cb="back_to_depts")],
     )
 
-# ── Earnings helpers ───────────────────────────────────────────────
-
 def get_doctor_earnings(tid: int) -> dict:
     try:
         rows = sb_get("bot_transactions",
@@ -427,11 +486,11 @@ def get_doctor_earnings(tid: int) -> dict:
                       f"&select=price,commission,net_amount,item_title,created_at"
                       f"&order=created_at.desc")
         return {
-            "total":   sum(r.get("price", 0) or 0 for r in rows),
-            "commis":  sum(r.get("commission", 0) or 0 for r in rows),
-            "net":     sum(r.get("net_amount", 0) or 0 for r in rows),
-            "count":   len(rows),
-            "recent":  rows[:5],
+            "total":  sum(r.get("price", 0) or 0 for r in rows),
+            "commis": sum(r.get("commission", 0) or 0 for r in rows),
+            "net":    sum(r.get("net_amount", 0) or 0 for r in rows),
+            "count":  len(rows),
+            "recent": rows[:5],
         }
     except Exception as e:
         logger.error(f"get_doctor_earnings: {e}")
@@ -439,7 +498,7 @@ def get_doctor_earnings(tid: int) -> dict:
 
 def record_transaction(doc_tid: int, doc_name: str,
                        item_type: str, item_title: str, price: float, user_id: int):
-    pct        = cfg_float("commission_pct", COMMISSION_PCT)
+    pct = cfg_float("commission_pct", 10.0)
     commission = round(price * pct / 100, 2)
     net        = round(price - commission, 2)
     sb_post("bot_transactions", {
@@ -453,57 +512,42 @@ def record_transaction(doc_tid: int, doc_name: str,
         "user_id":      user_id,
     })
 
-# ── FSM helpers ────────────────────────────────────────────────────
-
-def get_state(uid: int) -> dict:
-    rows = sb_get("bot_fsm_states", f"user_id=eq.{uid}&select=state,data")
-    if rows:
-        return {"state": rows[0].get("state", ""),
-                "data":  rows[0].get("data") or {}}
-    return {"state": "", "data": {}}
-
-def set_state(uid: int, state: str, data: dict = None):
-    body = {"user_id": uid, "state": state, "data": data or {}}
-    url  = f"{SUPABASE_URL}/rest/v1/bot_fsm_states?user_id=eq.{uid}"
-    d    = json.dumps(body).encode()
-    req  = Request(url, data=d,
-                   headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates"},
-                   method="PATCH")
-    try:
-        with urlopen(req, timeout=8) as r:
-            if r.status not in (200, 204):
-                sb_post("bot_fsm_states", body)
-    except Exception:
-        sb_post("bot_fsm_states", body)
-
-def clear_state(uid: int):
-    sb_delete("bot_fsm_states", f"user_id=eq.{uid}")
-
-def update_state_data(uid: int, extra: dict):
-    s = get_state(uid)
-    s["data"].update(extra)
-    set_state(uid, s["state"], s["data"])
-
-def start_session(patient_id: int, doctor_id: int, call_type: str):
-    set_state(patient_id, "in_session", {"partner_id": doctor_id, "call_type": call_type})
-    set_state(doctor_id,  "in_session", {"partner_id": patient_id, "call_type": call_type})
-
-def end_session_state(uid: int, partner_id: int):
-    clear_state(uid)
-    clear_state(partner_id)
-
-# ── Admin group commands (only run inside the admin group) ─────────
+# ── Admin group commands ────────────────────────────────────────────
 
 def handle_group_command(text: str, chat_id: int, user: dict):
-    """Handle /commands sent inside the admin group."""
+    """Handle /commands from inside the admin group."""
     uid = user.get("id", 0)
 
-    if text.startswith("/getgroupid"):
+    if text.startswith("/getgroupid") or text.startswith("/getgroupid@"):
         send(chat_id,
              f"ℹ️ <b>Group Info</b>\n\n"
-             f"• <b>Group chat ID:</b> <code>{chat_id}</code>\n"
-             f"• <b>Your user ID:</b> <code>{uid}</code>\n\n"
-             f"<i>Set ADMIN_GROUP_ID in bot_settings to: {chat_id}</i>")
+             f"• <b>This group ID:</b> <code>{chat_id}</code>\n"
+             f"• <b>Your Telegram ID:</b> <code>{uid}</code>\n"
+             f"• <b>Active admin_group_id:</b> <code>{get_admin_group()}</code>\n"
+             f"• <b>Env var ADMIN_GROUP_ID:</b> <code>{ADMIN_GROUP_ENV}</code>\n\n"
+             f"<i>Run /testgroup to verify the bot can send receipts here.</i>")
+
+    elif text.startswith("/testgroup"):
+        grp = get_admin_group()
+        if not grp:
+            send(chat_id,
+                 "❌ <b>ADMIN_GROUP_ID is not set!</b>\n\n"
+                 "Set it in Vercel Environment Variables → ADMIN_GROUP_ID → "
+                 f"<code>{chat_id}</code>")
+            return
+        result = tg("sendMessage", {
+            "chat_id": grp,
+            "text": f"✅ <b>Test successful!</b>\n\nBot can send to this group.\nGroup ID: <code>{grp}</code>",
+            "parse_mode": "HTML"
+        })
+        if result.get("ok"):
+            send(chat_id, "✅ Test message sent! Check above.")
+        else:
+            send(chat_id,
+                 f"❌ Failed!\n\nError: <code>{result.get('description','unknown')}</code>\n\n"
+                 f"Active group ID: <code>{grp}</code>\n"
+                 f"Verify:\n1. Bot is admin in this group\n"
+                 f"2. ADMIN_GROUP_ID env var = <code>{chat_id}</code>")
 
     elif text.startswith("/settings"):
         send(chat_id, all_settings_text())
@@ -511,29 +555,35 @@ def handle_group_command(text: str, chat_id: int, user: dict):
     elif text.startswith("/set "):
         parts = text.split(" ", 2)
         if len(parts) < 3:
-            send(chat_id, "❌ Usage: /set key value\nExample: /set cbe_account 1000123456")
+            send(chat_id, "Usage: /set key value\nExample: /set cbe_account 1000123456789")
             return
         key, value = parts[1].strip(), parts[2].strip()
         if set_cfg(key, value):
-            send(chat_id, f"✅ <b>{key}</b> updated to: <code>{value}</code>")
+            send(chat_id, f"✅ <b>{key}</b> → <code>{value}</code>")
         else:
-            send(chat_id, f"❌ Failed to update <b>{key}</b>. Check Supabase.")
+            send(chat_id, f"❌ Failed to update {key}. Make sure bot_settings table exists in Supabase.")
 
-    elif text.startswith("/testgroup"):
+    elif text.startswith("/help"):
         send(chat_id,
-             f"✅ Bot is working in this group!\n"
-             f"Group ID: <code>{chat_id}</code>")
+             "🤖 <b>Admin Group Commands</b>\n\n"
+             "/getgroupid — Show this group's chat ID\n"
+             "/testgroup — Test if bot can send receipts here\n"
+             "/settings — Show all bot settings\n"
+             "/set key value — Update a setting\n\n"
+             "<b>Settings keys:</b>\n"
+             "• admin_group_id, cbe_account, telebirr_account\n"
+             "• account_holder, free_channel, premium_channel\n"
+             "• free_group, support_phone_1, support_phone_2\n"
+             "• support_username, premium_price, commission_pct, website_url")
 
-    # Ignore all other messages in the group silently
+    # All other group messages: silently ignore (don't spam the group)
 
-# ── Bot handlers (private chat) ────────────────────────────────────
+# ── Private chat handlers ──────────────────────────────────────────
 
 def handle_start(chat_id: int, user: dict, payload: str = ""):
     if payload.startswith("login_"):
         handle_login_token(chat_id, user, payload[6:])
         return
-    # Refresh settings on each /start
-    _load_settings()
     clear_state(chat_id)
     send(chat_id,
          "👋 <b>እንኳን ወደ ጤናችን (Tenachin) የህክምና ማማከሪያ ቦት በደህና መጡ!</b>\n\n"
@@ -553,7 +603,7 @@ def handle_login_token(chat_id: int, user: dict, token: str):
              f"you'll be logged in automatically, {name}! 🚀")
     else:
         send(chat_id,
-             "❌ This login link expired or was already used. Please try again.")
+             "❌ Login link expired or already used. Please try again.")
 
 def handle_set_fees_start(chat_id: int, user: dict):
     uid = user.get("id", 0)
@@ -564,14 +614,14 @@ def handle_set_fees_start(chat_id: int, user: dict):
     online = get_doctor_online(uid)
     send(chat_id,
          f"💰 <b>የምክክር ዋጋ ማስተካከያ</b>\n\n"
-         f"💬 Text Chat:  <b>{fees['text']} ETB</b>\n"
-         f"🎙️ Voice Call: <b>{fees['voice']} ETB</b>\n"
-         f"📹 Video Call: <b>{fees['video']} ETB</b>\n\n"
+         f"💬 Text:  <b>{fees['text']} ETB</b>\n"
+         f"🎙️ Voice: <b>{fees['voice']} ETB</b>\n"
+         f"📹 Video: <b>{fees['video']} ETB</b>\n\n"
          f"📶 ሁኔታ: <b>{'🟢 Online' if online else '🔴 Offline'}</b>",
          markup=ik(
-             [btn("💬 Text Chat ዋጋ ለመለወጥ",   cb="set_fee_text")],
-             [btn("🎙️ Voice Call ዋጋ ለመለወጥ", cb="set_fee_voice")],
-             [btn("📹 Video Call ዋጋ ለመለወጥ", cb="set_fee_video")],
+             [btn("💬 Text ዋጋ ለመለወጥ",   cb="set_fee_text")],
+             [btn("🎙️ Voice ዋጋ ለመለወጥ", cb="set_fee_voice")],
+             [btn("📹 Video ዋጋ ለመለወጥ", cb="set_fee_video")],
              [btn("🔴 Go Offline" if online else "🟢 Go Online", cb="toggle_online")],
              [btn("⬅️ ወደ ሜኑ", cb="back_main")],
          ))
@@ -580,20 +630,19 @@ def handle_earnings(chat_id: int, user: dict):
     uid = user.get("id", 0)
     if not is_doctor(uid):
         send(chat_id,
-             "📊 <b>Earnings Tracker</b>\n\n"
-             "ይህ አገልግሎት ለስፔሻሊስት ሀኪሞች ብቻ ነው።\n\n"
-             f"ዶክተር ለመመዝገብ: {cfg('website_url')}")
+             "📊 <b>Earnings Tracker</b>\n\nይህ አገልግሎት ለዶክተሮች ብቻ ነው።\n"
+             f"ዶክተር ለመመዝገብ: {cfg('website_url','')}")
         return
     e = get_doctor_earnings(uid)
     text = (
-        f"📊 <b>የኔ ትርፍ (My Earnings)</b>\n\n"
-        f"💵 <b>ጠቅላላ ክፍያ:</b>    {e['total']:.0f} ETB\n"
-        f"🏛 <b>Commission ({cfg('commission_pct','10')}%):</b> {e['commis']:.0f} ETB\n"
-        f"✅ <b>ለኔ የሚደርሰኝ:</b>  {e['net']:.0f} ETB\n"
-        f"📋 <b>ጠቅላላ ግብይቶች:</b> {e['count']}\n"
+        f"📊 <b>የኔ ትርፍ</b>\n\n"
+        f"💵 ጠቅላላ: {e['total']:.0f} ETB\n"
+        f"🏛 Commission: {e['commis']:.0f} ETB\n"
+        f"✅ ለኔ: {e['net']:.0f} ETB\n"
+        f"📋 ግብይቶች: {e['count']}\n"
     )
     if e["recent"]:
-        text += "\n<b>ቅርብ ጊዜ ግብይቶች:</b>\n"
+        text += "\n<b>ቅርብ ጊዜ:</b>\n"
         for r in e["recent"]:
             d   = (r.get("created_at") or "")[:10]
             t   = r.get("item_title", "—")
@@ -603,20 +652,20 @@ def handle_earnings(chat_id: int, user: dict):
 
 MENU_HANDLERS = {
     "👨‍⚕️ ስፔሻሊስት ለማማከር": lambda cid, _: send(
-        cid, "👨‍⚕️ <b>የስፔሻሊስት ማማከሪያ ክፍል</b>\n\nማንነትዎን ይምረጡ፦", markup=SPEC_SUB),
+        cid, "👨‍⚕️ <b>ስፔሻሊስት ማማከሪያ</b>\n\nማንነትዎን ይምረጡ፦", markup=SPEC_SUB),
     "📚 የጤና ትምህርቶች": lambda cid, _: send(
-        cid, "📚 <b>የጤና ትምህርቶች Store</b>\n\nእባክዎ ይምረጡ፦", markup=edu_menu()),
+        cid, "📚 <b>የጤና ትምህርቶች Store</b>", markup=edu_menu()),
     "👥 የቡድን ህክምና ምክክሮች": lambda cid, _: send(
-        cid, "👥 <b>የቡድን ህክምና ውይይቶች</b>\n\nእባክዎ ይምረጡ፦", markup=group_menu()),
+        cid, "👥 <b>የቡድን ህክምና ውይይቶች</b>", markup=group_menu()),
     "🏠 የቤት ለቤት ህክምና & 🚨 ድንገተኛ አደጋ": lambda cid, _: send(
-        cid, "🏠 <b>የቤት ለቤት ህክምና እና ድንገተኛ አደጋ</b>\n\nእባክዎ ይምረጡ፦",
-        markup=HOMECARE_MENU),
+        cid, "🏠 <b>የቤት ለቤት ህክምና እና ድንገተኛ አደጋ</b>", markup=HOMECARE_MENU),
     "📞 እርዳታና ድጋፍ (Help)": lambda cid, _: send(
         cid,
-        f"📞 <b>Support Center</b>\n\n"
-        f"• ስልክ: <code>{cfg('support_phone_1')}</code> / <code>{cfg('support_phone_2')}</code>\n"
-        f"• Telegram: {cfg('support_username')}\n"
-        f"• Website: {cfg('website_url')}"),
+        f"📞 <b>Support</b>\n\n"
+        f"• <code>{cfg('support_phone_1','+251908343267')}</code>\n"
+        f"• <code>{cfg('support_phone_2','0967449552')}</code>\n"
+        f"• {cfg('support_username','@tenachinbottelemedicine')}\n"
+        f"• {cfg('website_url','')}"),
     "💰 የምክክር ዋጋዬን ማስተካከያ": lambda cid, user: handle_set_fees_start(cid, user),
     "📊 የኔ ትርፍ (Earnings)":    lambda cid, user: handle_earnings(cid, user),
 }
@@ -631,53 +680,46 @@ def handle_callback(cb: dict):
     uid  = user.get("id", 0)
     answer_cb(cb["id"])
 
-    # Fee / online toggle
     if data in ("set_fee_text", "set_fee_voice", "set_fee_video"):
         if not is_doctor(uid):
-            send(cid, "⛔ ይህ አገልግሎት ለስፔሻሊስቶች ብቻ ነው።")
+            send(cid, "⛔ ለዶክተሮች ብቻ ነው።")
             return
         fee_type = data.split("_")[2]
         labels   = {"text": "Text Chat", "voice": "Voice Call", "video": "Video Call"}
         set_state(uid, f"setting_fee_{fee_type}", {})
-        send(cid, f"💰 <b>አዲስ {labels[fee_type]} ዋጋ ያስገቡ (ETB):</b>\n\nምሳሌ: 150")
+        send(cid, f"💰 አዲስ {labels[fee_type]} ዋጋ (ETB):")
         return
 
     if data == "toggle_online":
         if not is_doctor(uid):
-            send(cid, "⛔ ይህ አገልግሎት ለስፔሻሊስቶች ብቻ ነው።")
+            send(cid, "⛔ ለዶክተሮች ብቻ ነው።")
             return
         new_status = toggle_online(uid)
-        send(cid, f"✅ ሁኔታዎ ወደ <b>{'🟢 Online' if new_status else '🔴 Offline'}</b> ተቀይሯል!",
+        send(cid, f"✅ ሁኔታዎ → <b>{'🟢 Online' if new_status else '🔴 Offline'}</b>",
              markup=MAIN_MENU)
         return
 
-    # Navigation
     if data == "back_main":
         clear_state(uid)
-        send(cid, "👋 እባክዎ ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
+        send(cid, "👋 ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
     elif data == "back_to_spec_choice":
-        edit_text(cid, mid, "👨‍⚕️ <b>ስፔሻሊስት ማማከሪያ</b>\n\nማንነትዎን ይምረጡ፦", markup=SPEC_SUB)
+        edit_text(cid, mid, "👨‍⚕️ ስፔሻሊስት ማማከሪያ — ማንነትዎን ይምረጡ፦", markup=SPEC_SUB)
     elif data == "back_to_depts":
-        edit_text(cid, mid, "🩺 <b>የስፔሻሊቲ ዘርፍ ይምረጡ፦</b>", markup=SPECIALTIES_KB)
+        edit_text(cid, mid, "🩺 የስፔሻሊቲ ዘርፍ ይምረጡ፦", markup=SPECIALTIES_KB)
     elif data == "back_to_edu_menu":
-        edit_text(cid, mid, "📚 <b>የጤና ትምህርቶች Store</b>", markup=edu_menu())
-
+        edit_text(cid, mid, "📚 Store", markup=edu_menu())
     elif data in ("spec_patient", "spec_gp"):
         role = "Patient" if data == "spec_patient" else "GP"
         update_state_data(uid, {"user_role": role})
-        edit_text(cid, mid, "🩺 <b>የስፔሻሊቲ ዘርፍ ይምረጡ፦</b>", markup=SPECIALTIES_KB)
-
+        edit_text(cid, mid, "🩺 የስፔሻሊቲ ዘርፍ ይምረጡ፦", markup=SPECIALTIES_KB)
     elif data.startswith("dept_"):
-        dept = data.split("_")[1]
-        edit_text(cid, mid, "👨‍⚕️ <b>ስፔሻሊስት ይምረጡ፦</b>", markup=doctors_kb(dept))
-
+        edit_text(cid, mid, "👨‍⚕️ ስፔሻሊስት ይምረጡ፦", markup=doctors_kb(data.split("_")[1]))
     elif data.startswith("select_doc_"):
         parts = data.split("_")
         did   = int(parts[2])
         dname = "_".join(parts[3:])
         edit_text(cid, mid, f"👨‍⚕️ <b>{dname}</b>\n\nየምክክር አይነት ይምረጡ፦",
                   markup=call_type_kb(did, dname))
-
     elif data.startswith("call_"):
         parts  = data.split("_")
         did    = int(parts[1])
@@ -687,25 +729,23 @@ def handle_callback(cb: dict):
         role   = get_state(uid)["data"].get("user_role", "Patient")
         if role == "GP":
             set_state(uid, "waiting_for_gp_case",
-                      {"doctor_id": did, "doctor_name": dname, "price": price, "call_type": ctype})
-            send(cid, f"👨‍⚕️ <b>ለ {dname} — Case Details</b>\n\n"
-                      "የካርድ/የታካሚ ታሪክ በአንድ መልእክት ጽፈው ይላኩ፦")
+                      {"doctor_id": did, "doctor_name": dname,
+                       "price": price, "call_type": ctype})
+            send(cid, f"📋 ለ <b>{dname}</b> — Case Details:\n\nየታካሚ ታሪክ ጽፈው ይላኩ፦")
         else:
             set_state(uid, "waiting_for_receipt",
-                      {"doctor_id": did, "doctor_name": dname, "price": price, "call_type": ctype})
+                      {"doctor_id": did, "doctor_name": dname,
+                       "price": price, "call_type": ctype})
             send(cid,
-                 f"📋 <b>የምክክር ጥያቄ ለ {dname}</b>\n\n"
-                 f"📞 <b>ዓይነት:</b> {ctype.upper()} Consultation\n\n"
+                 f"📋 <b>የምክክር ጥያቄ ለ {dname}</b>\n"
+                 f"📞 {ctype.upper()} Consultation\n\n"
                  + payment_text(price, dname))
-
     elif data == "start_doc_reg":
         set_state(uid, "doc_reg_name", {})
         send(cid, "📝 <b>ዶክተር ምዝገባ</b>\n\nሙሉ ስምዎን ያስገቡ:")
-
     elif data.startswith("store_dept_"):
-        dept = data.split("_")[2]
-        edit_text(cid, mid, "📚 <b>ምርጫዎን ያድርጉ፦</b>", markup=digital_products_kb(dept))
-
+        edit_text(cid, mid, "📚 ምርጫዎን ያድርጉ፦",
+                  markup=digital_products_kb(data.split("_")[2]))
     elif data.startswith("buy_prod_"):
         parts      = data.split("_")
         prod_name  = parts[2]
@@ -713,27 +753,19 @@ def handle_callback(cb: dict):
         file_type  = parts[4]
         set_state(uid, "waiting_for_store_receipt",
                   {"item_name": prod_name, "item_price": prod_price, "file_type": file_type})
-        send(cid,
-             f"📖 <b>{prod_name} ለመግዛት</b>\n\n"
-             + payment_text(prod_price))
-
+        send(cid, f"📖 <b>{prod_name}</b>\n\n" + payment_text(prod_price))
     elif data == "buy_premium_channel":
         price = cfg("premium_price", "24")
         set_state(uid, "waiting_for_premium_receipt", {})
-        send(cid,
-             f"💎 <b>ፕሪሚየም ቻናል አባልነት ({price} ETB/ወር)</b>\n\n"
-             + payment_text(price))
-
+        send(cid, f"💎 <b>ፕሪሚየም ቻናል ({price} ETB/ወር)</b>\n\n" + payment_text(price))
     elif data == "group_premium":
-        send(cid, f"🔒 <b>ፕሪሚየም ቪዲዮ/ድምፅ ውይይት</b>\n\nወርሃዊ ክፍያ: 150 ETB\n"
-                  f"አድሚን: {cfg('support_username')}")
+        send(cid, f"🔒 ፕሪሚየም ቪዲዮ ውይይት - 150 ETB/ወር\nአድሚን: {cfg('support_username','')}")
     elif data == "homecare_info":
-        send(cid, f"🏠 <b>የቤት ለቤት ህክምና</b>\n\n"
-                  f"📞 <code>{cfg('support_phone_1')}</code> / <code>{cfg('support_phone_2')}</code>")
+        send(cid, f"🏠 <b>የቤት ለቤት ህክምና</b>\n📞 <code>{cfg('support_phone_1','')}</code>")
     elif data == "emergency_alert":
-        send(cid, "🚨 <b>ድንገተኛ አደጋ</b>\n\nወደ አቅራቢያ ሆስፒታል ሄዱ!\n📞 <b>907</b> (ቀይ መስቀል)")
+        send(cid, "🚨 <b>ድንገተኛ አደጋ</b>\n\nወደ አቅራቢያ ሆስፒታል ሄዱ!\n📞 <b>907</b>")
 
-    # Admin: Approve / Reject
+    # Approve / Reject
     elif data.startswith("approve_") and not data.startswith(
             ("approve_prem_", "approve_doc_", "approve_store_")):
         parts    = data.split("_")
@@ -747,33 +779,23 @@ def handle_callback(cb: dict):
                            f"1-on-1 {ctype.upper()}", price, pat_id)
         if online:
             start_session(pat_id, doc_id, ctype)
-            send(pat_id,
-                 f"🟢 <b>ክፍያዎ ጸድቋል! ሀኪሙ Online ናቸው!</b>\n\n"
-                 f"ከ {doc_name} ጋር ምስጢራዊ ምክክር ተጀምሯል።",
+            send(pat_id, f"🟢 <b>ክፍያዎ ጸድቋል!</b>\nከ {doc_name} ጋር ምክክር ተጀምሯል።",
                  markup=end_consultation_kb(doc_id))
-            send(doc_id,
-                 f"👨‍⚕️ <b>አዲስ ታካሚ!</b>\n\n"
-                 f"👤 ID: <code>{pat_id}</code>\n💬 ዓይነት: {ctype.upper()}",
+            send(doc_id, f"👨‍⚕️ <b>አዲስ ታካሚ!</b>\n👤 ID: <code>{pat_id}</code>\n💬 {ctype.upper()}",
                  markup=end_consultation_kb(pat_id))
         else:
-            send(pat_id,
-                 f"🔴 <b>{doc_name} አሁን Offline ናቸው።</b>\n\nሰዓቱ ሲሆን ይነገርዎታል!")
-            send(doc_id,
-                 f"🚨 <b>አዲስ ታካሚ ከፍሏል!</b>\n\n"
-                 f"👤 ID: <code>{pat_id}</code>\n📞 {ctype.upper()}\n\nሰዓቱን ይጠቁሙ:",
+            send(pat_id, f"🔴 <b>{doc_name} Offline ናቸው።</b>\nሰዓቱ ሲሆን ይነገርዎታል!")
+            send(doc_id, f"🚨 <b>አዲስ ታካሚ ከፍሏል!</b>\n👤 ID: <code>{pat_id}</code>",
                  markup=ik([btn("🕒 ሰዓት ለመወሰን", cb=f"set_time_{pat_id}_{ctype}")]))
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>APPROVED</b>")
-
     elif data.startswith("approve_prem_"):
         pat_id = int(data.split("_")[2])
-        send(pat_id, f"🎉 <b>ፕሪሚየም ክፍያዎ ጸድቋል!</b>\n\n🔗 {cfg('premium_channel')}")
+        send(pat_id, f"🎉 <b>ፕሪሚየም ጸድቋል!</b>\n🔗 {cfg('premium_channel')}")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ PREMIUM APPROVED")
-
     elif data.startswith("approve_doc_"):
         doc_id = int(data.split("_")[2])
-        send(doc_id, "🎉 <b>ምዝገባዎ ጸድቋል!</b>\n\nአሁን ከሲስተሙ ጋር ተቀላቅለዋል።")
+        send(doc_id, "🎉 <b>ምዝገባዎ ጸድቋል!</b>\nወደ ሲስተሙ ተቀላቅለዋል።")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ DOCTOR APPROVED")
-
     elif data.startswith("approve_store_"):
         parts     = data.split("_")
         pat_id    = int(parts[2])
@@ -781,31 +803,26 @@ def handle_callback(cb: dict):
         price     = float(parts[4])
         item_name = "_".join(parts[5:]) if len(parts) > 5 else "Product"
         record_transaction(0, "Admin", file_type.upper(), item_name, price, pat_id)
-        send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n\n{item_name} ቶሎ ይደርስዎታል!")
+        send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n{item_name} ቶሎ ይደርስዎታል!")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ APPROVED")
-
     elif data.startswith("reject_"):
         pat_id = int(data.split("_")[1])
-        send(pat_id, "❌ <b>ደረሰኝዎ ውድቅ ተደርጓል!</b>\n\nትክክለኛ ደረሰኝ ይላኩ ወይም አድሚን ያናግሩ።")
+        send(pat_id, "❌ <b>ደረሰኝዎ ውድቅ ተደርጓል!</b>\nትክክለኛ ደረሰኝ ይላኩ ወይም አድሚን ያናግሩ።")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n❌ REJECTED")
-
     elif data.startswith("set_time_"):
         parts  = data.split("_")
         pat_id = int(parts[2])
         ctype  = parts[3]
         set_state(uid, "doc_scheduling",
                   {"target_patient_id": pat_id, "scheduled_call_type": ctype})
-        send(cid, "✍️ <b>ነፃ ሰዓቱን ይጻፉ (ምሳሌ: ነገ ከቀኑ 8:00):</b>")
-
+        send(cid, "✍️ ነፃ ሰዓቱን ይጻፉ (ምሳሌ: ነገ ከቀኑ 8:00):")
     elif data.startswith("confirm_end_"):
         other = int(data.split("_")[2])
-        send(cid, "⚠️ <b>ምክክሩን ማጠናቀቅ ይፈልጋሉ?</b>",
+        send(cid, "⚠️ ምክክሩን ማጠናቀቅ ይፈልጋሉ?",
              markup=ik([btn("✅ አዎ ጨርስ", cb=f"end_session_{other}"),
                         btn("❌ አይ ቀጥል", cb=f"cancel_end_{other}")]))
-
     elif data.startswith("cancel_end_"):
         tg("deleteMessage", {"chat_id": cid, "message_id": mid})
-
     elif data.startswith("end_session_"):
         other = int(data.split("_")[2])
         end_session_state(uid, other)
@@ -814,9 +831,8 @@ def handle_callback(cb: dict):
         uid_is_doc = is_doctor(uid)
         patient_id = other if uid_is_doc else uid
         doc_id2    = uid   if uid_is_doc else other
-        send(patient_id, "⭐ <b>ሀኪምዎን አገልግሎት ይመዝኑ፦</b>", markup=rating_kb(doc_id2))
+        send(patient_id, "⭐ ሀኪምዎን ይምዝኑ፦", markup=rating_kb(doc_id2))
         set_state(patient_id, "waiting_for_rating", {"rating_doctor_id": doc_id2})
-
     elif data.startswith("rate_"):
         parts   = data.split("_")
         score   = parts[1]
@@ -824,28 +840,27 @@ def handle_callback(cb: dict):
         update_state_data(uid, {"rating_score": score, "rating_doctor_id": doc_id2})
         set_state(uid, "waiting_for_feedback_comment", get_state(uid)["data"])
         edit_text(cid, mid,
-                  f"⭐ ደረጃ ስለሰጡ አመሰግናለን ({score}/5)!\n\n"
-                  "ተጨማሪ አስተያየት ካለ ጻፉ (ካለለዎት 'የለኝም' ይጻፉ):")
+                  f"⭐ ደረጃ ({score}/5) አመሰግናለን!\n\nተጨማሪ አስተያየት ካለ ጻፉ:")
 
 # ── Message dispatcher ─────────────────────────────────────────────
 
 def handle_message(msg: dict):
     cid       = msg["chat"]["id"]
-    chat_type = msg["chat"].get("type", "private")  # private / group / supergroup / channel
+    chat_type = msg["chat"].get("type", "private")
     user      = msg.get("from", {})
     uid       = user.get("id", 0)
     text      = msg.get("text", "")
     photo     = msg.get("photo")
     doc       = msg.get("document")
 
-    # ── Group chat: only handle slash commands ────────────────────────
+    # ── GROUP / SUPERGROUP: only handle slash commands ──────────────
     if chat_type in ("group", "supergroup"):
         if text and text.startswith("/"):
             handle_group_command(text, cid, user)
-        # Silently ignore all other group messages (photos, regular text, etc.)
+        # All non-command group messages silently ignored
         return
 
-    # ── Private chat below ────────────────────────────────────────────
+    # ── PRIVATE CHAT below ──────────────────────────────────────────
 
     if text.startswith("/start"):
         parts   = text.split(" ", 1)
@@ -854,13 +869,8 @@ def handle_message(msg: dict):
         return
 
     if text.startswith("/help"):
-        send(cid,
-             f"📞 ስልክ: <code>{cfg('support_phone_1')}</code>\n"
-             f"Telegram: {cfg('support_username')}")
-        return
-
-    if text.startswith("/settings") or text.startswith("/set"):
-        send(cid, all_settings_text())
+        send(cid, f"📞 <code>{cfg('support_phone_1','+251908343267')}</code>\n"
+                  f"Telegram: {cfg('support_username','')}")
         return
 
     for key, fn in MENU_HANDLERS.items():
@@ -879,7 +889,7 @@ def handle_message(msg: dict):
         price    = data.get("price", 0)
         caption  = (
             f"🧾 <b>አዲስ ክፍያ ደረሰኝ!</b>\n\n"
-            f"👤 ታካሚ: {user.get('first_name', '')} (<code>{uid}</code>)\n"
+            f"👤 ታካሚ: {user.get('first_name','')} (<code>{uid}</code>)\n"
             f"👨‍⚕️ ሀኪም: {doc_name} (<code>{doc_id}</code>)\n"
             f"💳 ክፍያ: {price} ETB"
         )
@@ -891,13 +901,10 @@ def handle_message(msg: dict):
         send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል። ክፍያው ሲረጋገጥ ከሀኪሙ ጋር ይገናኛሉ።")
         return
 
-    # GP Case details
     if state == "waiting_for_gp_case" and text:
         data["case_details"] = text
         set_state(uid, "waiting_for_gp_receipt", data)
-        send(cid,
-             f"✅ <b>Case details ተመዝግቧል!</b>\n\n"
-             + payment_text(data.get("price", 0)))
+        send(cid, f"✅ Case details ተመዝግቧል!\n\n" + payment_text(data.get("price", 0)))
         return
 
     if state == "waiting_for_gp_receipt" and (photo or doc):
@@ -905,10 +912,10 @@ def handle_message(msg: dict):
         doc_id   = data.get("doctor_id", 0)
         price    = data.get("price", 0)
         caption  = (
-            f"🧾 <b>GP ማማከር ደረሰኝ!</b>\n\n"
-            f"👤 GP: {user.get('first_name', '')} (<code>{uid}</code>)\n"
+            f"🧾 <b>GP ምክክር ደረሰኝ!</b>\n\n"
+            f"👤 GP: {user.get('first_name','')} (<code>{uid}</code>)\n"
             f"👨‍⚕️ ስፔሻሊስት: {doc_name} (<code>{doc_id}</code>)\n"
-            f"💳 {price} ETB\n\n📝 Case:\n{data.get('case_details', '')}"
+            f"💳 {price} ETB\n\n📝 Case:\n{data.get('case_details','')}"
         )
         fid = photo[-1]["file_id"] if photo else doc["file_id"]
         notify_admin(fid, caption,
@@ -918,14 +925,13 @@ def handle_message(msg: dict):
         send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል።")
         return
 
-    # Store receipt
     if state == "waiting_for_store_receipt" and (photo or doc):
         item_name  = data.get("item_name", "Product")
         item_price = data.get("item_price", 0)
         file_type  = data.get("file_type", "pdf")
         caption = (
             f"🛒 <b>Digital Product ክፍያ!</b>\n\n"
-            f"👤 ገዢ: {user.get('first_name', '')} (<code>{uid}</code>)\n"
+            f"👤 ገዢ: {user.get('first_name','')} (<code>{uid}</code>)\n"
             f"📦 ምርት: {item_name} ({file_type.upper()})\n💳 {item_price} ETB"
         )
         fid = photo[-1]["file_id"] if photo else doc["file_id"]
@@ -937,12 +943,11 @@ def handle_message(msg: dict):
         send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል። ፋይሉ ቶሎ ይደርስዎታል!")
         return
 
-    # Premium receipt
     if state == "waiting_for_premium_receipt" and (photo or doc):
         caption = (
-            f"💎 <b>Premium Channel ክፍያ!</b>\n\n"
-            f"👤 {user.get('first_name', '')} (<code>{uid}</code>)\n"
-            f"💳 {cfg('premium_price', '24')} ETB/ወር"
+            f"💎 <b>Premium ክፍያ!</b>\n\n"
+            f"👤 {user.get('first_name','')} (<code>{uid}</code>)\n"
+            f"💳 {cfg('premium_price','24')} ETB/ወር"
         )
         fid = photo[-1]["file_id"] if photo else doc["file_id"]
         notify_admin(fid, caption,
@@ -971,13 +976,13 @@ def handle_message(msg: dict):
         data["reg_fee"] = text
         set_state(uid, "doc_reg_license", data)
         send(cid, f"📄 የህክምና ፈቃድዎን ፎቶ ወይም Document ይላኩ፦\n\n"
-                  f"<b>ወይም ሙሉ ምዝገባ ለማድረግ:</b> {cfg('website_url')}")
+                  f"ወይም ድረ-ገጻችን: {cfg('website_url','')}")
         return
     if state == "doc_reg_license" and (photo or doc):
         caption = (
             f"📝 <b>አዲስ ዶክተር ምዝገባ!</b>\n\n"
             f"👤 ስም: {data.get('reg_name')}\n"
-            f"🆔 Telegram ID: <code>{uid}</code>\n"
+            f"🆔 Telegram: <code>{uid}</code>\n"
             f"🩺 ስፔሻሊቲ: {data.get('reg_specialty')}\n"
             f"🏥 ተቋም: {data.get('reg_institution')}\n"
             f"💳 ክፍያ: {data.get('reg_fee')} ETB"
@@ -1004,37 +1009,30 @@ def handle_message(msg: dict):
         set_doctor_fees(uid, fees["text"], fees["voice"], fees["video"])
         clear_state(uid)
         labels = {"text": "Text Chat", "voice": "Voice Call", "video": "Video Call"}
-        send(cid,
-             f"✅ <b>{labels[fee_type]} ዋጋ → {new_fee} ETB</b>\n\n"
-             f"💬 Text: {fees['text']} ETB | 🎙️ Voice: {fees['voice']} ETB | 📹 Video: {fees['video']} ETB",
-             markup=MAIN_MENU)
+        send(cid, f"✅ {labels[fee_type]} → {new_fee} ETB", markup=MAIN_MENU)
         return
 
-    # Doctor scheduling
     if state == "doc_scheduling" and text:
         pat_id = data.get("target_patient_id")
         ctype  = data.get("scheduled_call_type", "")
         if pat_id:
             send(int(pat_id),
-                 f"🗓️ <b>ቀጠሮ ሰዓት!</b>\n\n"
-                 f"👨‍⚕️ ሀኪም: {user.get('first_name', '')}\n"
-                 f"🕒 ሰዓት: {text}\n📞 ዓይነት: {ctype.upper()}")
+                 f"🗓️ <b>ቀጠሮ!</b>\n"
+                 f"👨‍⚕️ {user.get('first_name','')}\n🕒 {text}\n📞 {ctype.upper()}")
             send(cid, "✅ ሰዓቱ ለታካሚው ተልኳል!")
         clear_state(uid)
         return
 
-    # Rating feedback
     if state == "waiting_for_feedback_comment" and text:
         doc_id2 = data.get("rating_doctor_id")
         score   = data.get("rating_score", "?")
         if doc_id2:
             send(int(doc_id2),
-                 f"🌟 <b>አዲስ Feedback!</b>\n\n⭐ ደረጃ: {score}/5\n💬 አስተያየት: {text}")
+                 f"🌟 <b>Feedback!</b>\n⭐ {score}/5\n💬 {text}")
         clear_state(uid)
-        send(cid, "🙏 ለሰጡን አስተያየት እናመሰግናለን! ጤና ይስጥልን።", markup=MAIN_MENU)
+        send(cid, "🙏 አስተያየትዎ ደርሷል! ጤና ይስጥልን።", markup=MAIN_MENU)
         return
 
-    # Active session relay
     if state == "in_session":
         partner = data.get("partner_id")
         if partner:
@@ -1044,8 +1042,6 @@ def handle_message(msg: dict):
     send(cid, "እባክዎ ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
 
 
-# ── Update router ──────────────────────────────────────────────────
-
 def process_update(update: dict):
     if "message" in update:
         handle_message(update["message"])
@@ -1053,17 +1049,23 @@ def process_update(update: dict):
         handle_callback(update["callback_query"])
 
 
-# ── Vercel handler ─────────────────────────────────────────────────
-
 class handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"Tena Special Bot is active.")
+        grp = get_admin_group()
+        self.wfile.write(json.dumps({
+            "status": "active",
+            "admin_group_env": ADMIN_GROUP_ENV,
+            "admin_group_db":  cfg_int("admin_group_id", 0),
+            "admin_group_active": grp,
+            "bot_token_set": bool(BOT_TOKEN),
+            "supabase_set":  bool(SUPABASE_URL and SUPABASE_KEY),
+        }).encode())
 
     def do_POST(self):
         try:
