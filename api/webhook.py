@@ -725,6 +725,48 @@ def handle_callback(cb: dict):
     elif data == "emergency_alert":
         send(cid, "🚨 <b>ድንገተኛ አደጋ!</b>\nወደ አቅራቢያ ሆስፒታል ይሂዱ ወይም 📞 <b>907</b> ይደውሉ።")
 
+    # ── Doctor Application Approve / Decline Callbacks ────────────
+    elif data.startswith("appr_da_"):
+        doc_id = data.split("_")[2]
+        # 1. Update doctor_applications
+        sb_patch("doctor_applications", f"doctor_id=eq.{doc_id}", {
+            "status": "approved",
+            "reviewed_at": "now()"
+        })
+        # 2. Update profiles
+        sb_patch("profiles", f"id=eq.{doc_id}", {
+            "account_type": "doctor"
+        })
+        # 3. Notify doctor on Telegram if telegram_id exists
+        prof_rows = sb_get("profiles", f"id=eq.{doc_id}&select=telegram_id,full_name")
+        if prof_rows and prof_rows[0].get("telegram_id"):
+            tid = int(prof_rows[0]["telegram_id"])
+            send(tid,
+                 "🎉 <b>እንኳን ደስ አለዎት! የህክምና ማማከሪያ ምዝገባዎ በአድሚን ጸድቋል።</b>\n\n"
+                 "አሁን በቦቱና በድረ-ገጹ ታካሚዎችን ማማከር ይችላሉ። ጤና ይስጥልን!")
+            set_doctor_fees(tid, 100, 200, 300)
+            toggle_online(tid)
+
+        try:
+            edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>DOCTOR APPROVED BY ADMIN</b>")
+        except Exception:
+            send(cid, f"✅ Doctor application ({doc_id}) APPROVED!")
+
+    elif data.startswith("rej_da_"):
+        doc_id = data.split("_")[2]
+        sb_patch("doctor_applications", f"doctor_id=eq.{doc_id}", {
+            "status": "declined",
+            "reviewed_at": "now()"
+        })
+        prof_rows = sb_get("profiles", f"id=eq.{doc_id}&select=telegram_id")
+        if prof_rows and prof_rows[0].get("telegram_id"):
+            tid = int(prof_rows[0]["telegram_id"])
+            send(tid, "❌ <b>የዶክተር ምዝገባ ጥያቄዎ ውድቅ ተደርጓል።</b>\n\nለበለጠ መረጃ አድሚን ያነጋግሩ።")
+        try:
+            edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n❌ <b>DECLINED BY ADMIN</b>")
+        except Exception:
+            send(cid, f"❌ Doctor application ({doc_id}) DECLINED.")
+
     # ── Admin Approve / Reject Callbacks (short IDs) ──────────────
     elif data.startswith("appr_c_"):
         parts  = data.split("_")
@@ -951,10 +993,76 @@ def handle_message(msg: dict):
 
     send(cid, "እባክዎ ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
 
+# ── External Notification Handler ──────────────────────────────────
+
+def handle_doctor_app_notification(data: dict) -> bool:
+    grp = get_admin_group()
+    if not grp:
+        logger.error("No admin group configured for doctor app notification.")
+        return False
+
+    full_name   = data.get("full_name", "Doctor")
+    specialty   = data.get("specialty", "General")
+    license_no  = data.get("license_number", "N/A")
+    workplace   = data.get("workplace", "N/A")
+    exp         = data.get("experience_years", 0)
+    phone       = data.get("phone", "N/A")
+    tg_user     = data.get("telegram", "N/A")
+    fee         = data.get("consultation_fee", "N/A")
+    bio         = data.get("bio", "")
+    pdf_url     = data.get("file_url", "")
+    doc_id      = str(data.get("doctor_id", ""))
+
+    caption = (
+        f"📝 <b>አዲስ የዶክተር ማመልከቻ (New Doctor Application)</b>\n\n"
+        f"👤 <b>ስም:</b> {full_name}\n"
+        f"🩺 <b>ስፔሻሊቲ:</b> {specialty}\n"
+        f"📜 <b>License #:</b> <code>{license_no}</code>\n"
+        f"🏥 <b>ተቋም:</b> {workplace}\n"
+        f"⏳ <b>ልምድ:</b> {exp} ዓመት\n"
+        f"💰 <b>የምክክር ክፍያ:</b> {fee} ETB\n"
+        f"📞 <b>ስልክ:</b> <code>{phone}</code>\n"
+        f"✈️ <b>Telegram:</b> {tg_user}\n"
+    )
+    if bio:
+        caption += f"\n📝 <b>Bio:</b> <i>{bio[:180]}</i>\n"
+
+    buttons = [
+        [btn("✅ Approve Doctor", cb=f"appr_da_{doc_id}"),
+         btn("❌ Decline", cb=f"rej_da_{doc_id}")]
+    ]
+    if pdf_url:
+        buttons.append([btn("📄 View License Document (PDF)", url=pdf_url)])
+
+    akb = ik(*buttons)
+
+    # Try sending document
+    if pdf_url:
+        res = tg("sendDocument", {
+            "chat_id": grp,
+            "document": pdf_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+            "reply_markup": akb
+        })
+        if res.get("ok"):
+            return True
+
+    # Fallback to message
+    res2 = tg("sendMessage", {
+        "chat_id": grp,
+        "text": caption,
+        "parse_mode": "HTML",
+        "reply_markup": akb
+    })
+    return res2.get("ok", False)
+
 # ── Webhook Update Handler ─────────────────────────────────────────
 
 def process_update(update: dict):
-    if "message" in update:
+    if update.get("action") == "notify_doctor_app":
+        handle_doctor_app_notification(update)
+    elif "message" in update:
         handle_message(update["message"])
     elif "callback_query" in update:
         handle_callback(update["callback_query"])
