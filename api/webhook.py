@@ -1,7 +1,7 @@
 """
 Tena Special Bot — Full Vercel Webhook Handler
 Dynamic doctors from Supabase, full Amharic UI, FSM via Supabase,
-profit tracking for doctors, no hardcoded specialist IDs.
+profit tracking for doctors, admin group notifications.
 """
 import json
 import os
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS       = [int(x) for x in os.getenv("ADMIN_IDS", "501384766,5872954068").split(",")]
+ADMIN_GROUP     = int(os.getenv("ADMIN_GROUP_ID", "0"))  # Telegram group chat ID (negative number)
 SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_KEY", "")
 WEBSITE_URL     = "https://healthlink-gate-main-nine.vercel.app/"
@@ -24,7 +24,7 @@ SUPPORT_USERNAME= "@tenachinbottelemedicine"
 FREE_CHANNEL    = "https://t.me/tenachinfree"
 PREMIUM_CHANNEL = "https://t.me/tenachinpremium"
 FREE_GROUP      = "https://t.me/+UXHaDU3GIudlY2U0"
-COMMISSION_PCT  = 10.0  # platform commission percentage
+COMMISSION_PCT  = 10.0
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -60,14 +60,14 @@ def edit_caption(chat_id, message_id, caption):
 def answer_cb(cb_id, text=""):
     tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": text})
 
-def fwd_photo(admin_id, file_id, caption, markup=None):
-    p = {"chat_id": admin_id, "photo": file_id, "caption": caption, "parse_mode": "HTML"}
+def fwd_photo(chat_id, file_id, caption, markup=None):
+    p = {"chat_id": chat_id, "photo": file_id, "caption": caption, "parse_mode": "HTML"}
     if markup:
         p["reply_markup"] = markup
     tg("sendPhoto", p)
 
-def fwd_doc(admin_id, file_id, caption, markup=None):
-    p = {"chat_id": admin_id, "document": file_id, "caption": caption, "parse_mode": "HTML"}
+def fwd_doc(chat_id, file_id, caption, markup=None):
+    p = {"chat_id": chat_id, "document": file_id, "caption": caption, "parse_mode": "HTML"}
     if markup:
         p["reply_markup"] = markup
     tg("sendDocument", p)
@@ -75,10 +75,18 @@ def fwd_doc(admin_id, file_id, caption, markup=None):
 def copy_msg(to_id, from_id, msg_id):
     tg("copyMessage", {"chat_id": to_id, "from_chat_id": from_id, "message_id": msg_id})
 
+def notify_admin(file_id: str, caption: str, markup, is_photo: bool):
+    """Forward a receipt/notification to the admin group."""
+    if not ADMIN_GROUP:
+        logger.warning("ADMIN_GROUP_ID not set in environment variables.")
+        return
+    (fwd_photo if is_photo else fwd_doc)(ADMIN_GROUP, file_id, caption, markup=markup)
+
 # ── Keyboards ─────────────────────────────────────────────────────
 
 def rk(*rows):
-    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True}
+    return {"keyboard": [[{"text": t} for t in row] for row in rows],
+            "resize_keyboard": True}
 
 def ik(*rows):
     return {"inline_keyboard": list(rows)}
@@ -134,7 +142,6 @@ HOMECARE_MENU = ik(
 )
 
 def digital_products_kb(dept):
-    """Digital products — admin handles delivery manually."""
     if dept == "internal":
         return ik(
             [btn("📘 የደም ግፊት መከላከያ - 200 ETB", cb="buy_prod_HTN Book_200_pdf")],
@@ -155,12 +162,13 @@ def digital_products_kb(dept):
         )
 
 def admin_approve_kb(approve_cb, reject_user_id):
-    return ik([btn("✅ Approve", cb=approve_cb), btn("❌ Reject", cb=f"reject_{reject_user_id}")])
+    return ik([btn("✅ Approve", cb=approve_cb),
+               btn("❌ Reject",  cb=f"reject_{reject_user_id}")])
 
 def rating_kb(doctor_id):
     return ik([
-        btn("⭐ 1", cb=f"rate_1_{doctor_id}"),
-        btn("⭐⭐ 2", cb=f"rate_2_{doctor_id}"),
+        btn("⭐ 1",       cb=f"rate_1_{doctor_id}"),
+        btn("⭐⭐ 2",    cb=f"rate_2_{doctor_id}"),
         btn("⭐⭐⭐ 3", cb=f"rate_3_{doctor_id}"),
         btn("⭐⭐⭐⭐ 4", cb=f"rate_4_{doctor_id}"),
         btn("⭐⭐⭐⭐⭐ 5", cb=f"rate_5_{doctor_id}"),
@@ -191,7 +199,8 @@ def sb_get(table, params=""):
 def sb_post(table, body):
     url  = f"{SUPABASE_URL}/rest/v1/{table}"
     data = json.dumps(body).encode()
-    req  = Request(url, data=data, headers={**_sb_headers(), "Prefer": "return=minimal"})
+    req  = Request(url, data=data,
+                   headers={**_sb_headers(), "Prefer": "return=minimal"})
     try:
         with urlopen(req, timeout=8):
             return True
@@ -224,7 +233,6 @@ def sb_delete(table, query):
 # ── Dynamic doctor helpers ─────────────────────────────────────────
 
 def get_doctors_list(dept: str = "") -> list:
-    """Fetch approved doctors from Supabase's public_doctor_profiles view."""
     try:
         docs = sb_get("public_doctor_profiles",
                       "select=full_name,specialty,telegram_id")
@@ -245,9 +253,7 @@ def get_doctors_list(dept: str = "") -> list:
         logger.error(f"get_doctors_list: {e}")
         return []
 
-
 def is_doctor(uid: int) -> bool:
-    """True if this Telegram user is an approved doctor."""
     try:
         rows = sb_get("public_doctor_profiles",
                       f"telegram_id=eq.{uid}&select=telegram_id")
@@ -255,9 +261,7 @@ def is_doctor(uid: int) -> bool:
     except Exception:
         return False
 
-
 def get_doctor_name_by_tid(telegram_id: int) -> str:
-    """Look up doctor's full name by Telegram ID."""
     try:
         rows = sb_get("public_doctor_profiles",
                       f"telegram_id=eq.{telegram_id}&select=full_name")
@@ -267,65 +271,48 @@ def get_doctor_name_by_tid(telegram_id: int) -> str:
         pass
     return f"Doctor ({telegram_id})"
 
-
 def get_doctor_online(telegram_id: int) -> bool:
-    """Get doctor's online status from doctor_consultation_fees."""
     rows = sb_get("doctor_consultation_fees",
                   f"telegram_id=eq.{telegram_id}&select=is_online")
     return rows[0].get("is_online", False) if rows else False
 
-
 def doctors_kb(dept: str):
-    """Build doctor selection keyboard dynamically from Supabase."""
     rows = []
-    docs = get_doctors_list(dept)
-    for d in docs:
+    for d in get_doctors_list(dept):
         tid    = int(d["telegram_id"])
         name   = d.get("full_name", "Doctor")
         online = get_doctor_online(tid)
         status = "🟢 Online" if online else "🔴 Offline"
         rows.append([btn(f"{name} ({status})", cb=f"select_doc_{tid}_{name}")])
-
     if not rows:
         rows.append([btn("❌ ምንም ዶክተር አልተገኘም", cb="back_to_depts")])
     rows.append([btn("⬅️ ተመለስ", cb="back_to_depts")])
     return {"inline_keyboard": rows}
 
-
-# ── Doctor fee helpers ─────────────────────────────────────────────
+# ── Doctor fee / online helpers ────────────────────────────────────
 
 def get_doctor_fees(doctor_id: int) -> dict:
     rows = sb_get("doctor_consultation_fees",
                   f"telegram_id=eq.{doctor_id}&select=text_fee,voice_fee,video_fee")
     if rows:
-        return {
-            "text":  rows[0].get("text_fee", 100),
-            "voice": rows[0].get("voice_fee", 200),
-            "video": rows[0].get("video_fee", 300),
-        }
+        return {"text":  rows[0].get("text_fee", 100),
+                "voice": rows[0].get("voice_fee", 200),
+                "video": rows[0].get("video_fee", 300)}
     return {"text": 100, "voice": 200, "video": 300}
-
 
 def set_doctor_fees(doctor_id: int, text_fee, voice_fee, video_fee):
     body = {"telegram_id": doctor_id, "text_fee": text_fee,
             "voice_fee": voice_fee, "video_fee": video_fee}
-    ok = sb_patch("doctor_consultation_fees",
-                  f"telegram_id=eq.{doctor_id}", body)
-    if not ok:
+    if not sb_patch("doctor_consultation_fees", f"telegram_id=eq.{doctor_id}", body):
         sb_post("doctor_consultation_fees", body)
 
-
 def toggle_online(doctor_id: int) -> bool:
-    """Toggle doctor online status, return new status."""
     current = get_doctor_online(doctor_id)
     new_val = not current
     body = {"telegram_id": doctor_id, "is_online": new_val}
-    ok = sb_patch("doctor_consultation_fees",
-                  f"telegram_id=eq.{doctor_id}", body)
-    if not ok:
+    if not sb_patch("doctor_consultation_fees", f"telegram_id=eq.{doctor_id}", body):
         sb_post("doctor_consultation_fees", body)
     return new_val
-
 
 def call_type_kb(doctor_id, doctor_name):
     fees = get_doctor_fees(doctor_id)
@@ -339,8 +326,7 @@ def call_type_kb(doctor_id, doctor_name):
         [btn("⬅️ ተመለስ", cb="back_to_depts")],
     )
 
-
-# ── Earnings / Profit helpers ──────────────────────────────────────
+# ── Earnings helpers ───────────────────────────────────────────────
 
 def get_doctor_earnings(telegram_id: int) -> dict:
     try:
@@ -348,15 +334,14 @@ def get_doctor_earnings(telegram_id: int) -> dict:
                       f"doctor_telegram_id=eq.{telegram_id}"
                       f"&select=price,commission,net_amount,item_title,created_at"
                       f"&order=created_at.desc")
-        total   = sum(r.get("price", 0) or 0 for r in rows)
-        commis  = sum(r.get("commission", 0) or 0 for r in rows)
-        net     = sum(r.get("net_amount", 0) or 0 for r in rows)
+        total  = sum(r.get("price", 0) or 0 for r in rows)
+        commis = sum(r.get("commission", 0) or 0 for r in rows)
+        net    = sum(r.get("net_amount", 0) or 0 for r in rows)
         return {"total": total, "commission": commis, "net": net,
                 "count": len(rows), "recent": rows[:5]}
     except Exception as e:
         logger.error(f"get_doctor_earnings: {e}")
         return {"total": 0, "commission": 0, "net": 0, "count": 0, "recent": []}
-
 
 def record_transaction(doctor_telegram_id: int, doctor_name: str,
                        item_type: str, item_title: str, price: float, user_id: int):
@@ -373,14 +358,12 @@ def record_transaction(doctor_telegram_id: int, doctor_name: str,
         "user_id":       user_id,
     })
 
-
-# ── FSM State helpers ──────────────────────────────────────────────
+# ── FSM helpers ────────────────────────────────────────────────────
 
 def get_state(user_id: int) -> dict:
     rows = sb_get("bot_fsm_states", f"user_id=eq.{user_id}&select=state,data")
     if rows:
-        d = rows[0].get("data") or {}
-        return {"state": rows[0].get("state", ""), "data": d}
+        return {"state": rows[0].get("state", ""), "data": rows[0].get("data") or {}}
     return {"state": "", "data": {}}
 
 def set_state(user_id: int, state: str, data: dict = None):
@@ -404,8 +387,6 @@ def update_state_data(user_id: int, extra: dict):
     s = get_state(user_id)
     s["data"].update(extra)
     set_state(user_id, s["state"], s["data"])
-
-# ── Session helpers ────────────────────────────────────────────────
 
 def start_session(patient_id: int, doctor_id: int, call_type: str):
     set_state(patient_id, "in_session", {"partner_id": doctor_id, "call_type": call_type})
@@ -439,9 +420,7 @@ def handle_login_token(chat_id: int, user: dict, token: str):
              f"✅ <b>Login confirmed!</b>\n\nGo back to the website — "
              f"you'll be logged in automatically, {name}! 🚀")
     else:
-        send(chat_id,
-             "❌ This login link expired or was already used.\n"
-             "Please go back and try again.")
+        send(chat_id, "❌ This login link expired or was already used.\nPlease go back and try again.")
 
 def handle_set_fees_start(chat_id: int, user: dict):
     uid = user.get("id", 0)
@@ -461,8 +440,7 @@ def handle_set_fees_start(chat_id: int, user: dict):
              [btn("💬 Text Chat ዋጋ ለመለወጥ",   cb="set_fee_text")],
              [btn("🎙️ Voice Call ዋጋ ለመለወጥ", cb="set_fee_voice")],
              [btn("📹 Video Call ዋጋ ለመለወጥ", cb="set_fee_video")],
-             [btn(f"{'🔴 Go Offline' if online else '🟢 Go Online'}",
-                  cb="toggle_online")],
+             [btn("🔴 Go Offline" if online else "🟢 Go Online", cb="toggle_online")],
              [btn("⬅️ ወደ ሜኑ", cb="back_main")],
          ))
 
@@ -472,22 +450,22 @@ def handle_earnings(chat_id: int, user: dict):
         send(chat_id,
              "📊 <b>Earnings Tracker</b>\n\n"
              "ይህ አገልግሎት ለስፔሻሊስት ሀኪሞች ብቻ ነው።\n\n"
-             f"ዶክተር ለመመዝገብ ወደ ድረ-ገጻችን ይሂዱ: {WEBSITE_URL}")
+             f"ዶክተር ለመመዝገብ: {WEBSITE_URL}")
         return
     e = get_doctor_earnings(uid)
     text = (
         f"📊 <b>የኔ ትርፍ (My Earnings)</b>\n\n"
         f"💵 <b>ጠቅላላ ክፍያ:</b>   {e['total']:.0f} ETB\n"
-        f"🏛 <b>Commission ({COMMISSION_PCT:.0f}%):</b> {e['commission']:.0f} ETB\n"
-        f"✅ <b>ለእኔ የሚደርሰኝ:</b>  {e['net']:.0f} ETB\n"
-        f"📋 <b>ጠቅላላ ግብይቶች:</b>  {e['count']}\n"
+        f"🏛 <b>Commission (10%):</b> {e['commission']:.0f} ETB\n"
+        f"✅ <b>ለኔ የሚደርሰኝ:</b>  {e['net']:.0f} ETB\n"
+        f"📋 <b>ጠቅላላ ግብይቶች:</b> {e['count']}\n"
     )
     if e["recent"]:
         text += "\n<b>ቅርብ ጊዜ ግብይቶች:</b>\n"
         for r in e["recent"]:
-            d    = (r.get("created_at") or "")[:10]
-            t    = r.get("item_title", "—")
-            amt  = r.get("price", 0)
+            d   = (r.get("created_at") or "")[:10]
+            t   = r.get("item_title", "—")
+            amt = r.get("price", 0)
             text += f"  • {d} | {t} | {amt} ETB\n"
     send(chat_id, text, markup=MAIN_MENU)
 
@@ -498,7 +476,7 @@ MENU_HANDLERS = {
         cid, "👨‍⚕️ <b>የስፔሻሊስት ማማከሪያ ክፍል</b>\n\nእባክዎ ማንነትዎን ይምረጡ፦",
         markup=SPEC_SUB),
     "📚 የጤና ትምህርቶች": lambda cid, _: send(
-        cid, "📚 <b>የጤና ትምህርቶች እና ዲጂታል መጻሕፍት Store</b>\n\nእባክዎ ይምረጡ፦",
+        cid, "📚 <b>የጤና ትምህርቶች እና ዲጂታል Store</b>\n\nእባክዎ ይምረጡ፦",
         markup=EDU_MENU),
     "👥 የቡድን ህክምና ምክክሮች": lambda cid, _: send(
         cid, "👥 <b>የቡድን ህክምና ውይይቶች</b>\n\nእባክዎ ይምረጡ፦",
@@ -516,7 +494,7 @@ MENU_HANDLERS = {
     "📊 የኔ ትርፍ (Earnings)":    lambda cid, user: handle_earnings(cid, user),
 }
 
-# ── Callback handlers ──────────────────────────────────────────────
+# ── Callback handler ───────────────────────────────────────────────
 
 def handle_callback(cb: dict):
     data = cb.get("data", "")
@@ -527,7 +505,7 @@ def handle_callback(cb: dict):
 
     answer_cb(cb["id"])
 
-    # ── Doctor fee / online toggle ───────────────────────────────────
+    # Fee / online toggle
     if data in ("set_fee_text", "set_fee_voice", "set_fee_video"):
         if not is_doctor(uid):
             send(cid, "⛔ ይህ አገልግሎት ለስፔሻሊስቶች ብቻ ነው።")
@@ -547,54 +525,53 @@ def handle_callback(cb: dict):
         send(cid, f"✅ ሁኔታዎ ወደ <b>{label}</b> ተቀይሯል!", markup=MAIN_MENU)
         return
 
-    # ── Navigation ───────────────────────────────────────────────────
+    # Navigation
     if data == "back_main":
         clear_state(uid)
-        send(cid, "👋 እባክዎ ከታች ካለው ሜኑ ይምረጡ፦", markup=MAIN_MENU)
+        send(cid, "👋 እባክዎ ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
     elif data == "back_to_spec_choice":
-        edit_text(cid, mid, "👨‍⚕️ <b>ስፔሻሊስት ማማከሪያ ክፍል</b>\n\nማንነትዎን ይምረጡ፦", markup=SPEC_SUB)
+        edit_text(cid, mid, "👨‍⚕️ <b>ስፔሻሊስት ማማከሪያ</b>\n\nማንነትዎን ይምረጡ፦", markup=SPEC_SUB)
     elif data == "back_to_depts":
         edit_text(cid, mid, "🩺 <b>የስፔሻሊቲ ዘርፍ ይምረጡ፦</b>", markup=SPECIALTIES_KB)
     elif data == "back_to_edu_menu":
-        edit_text(cid, mid, "📚 <b>የጤና ትምህርቶች Store</b>\n\nእባክዎ ይምረጡ፦", markup=EDU_MENU)
+        edit_text(cid, mid, "📚 <b>የጤና ትምህርቶች Store</b>", markup=EDU_MENU)
 
-    # ── Specialist sub-menu ──────────────────────────────────────────
+    # Specialist sub-menu
     elif data in ("spec_patient", "spec_gp"):
         role = "Patient" if data == "spec_patient" else "GP"
         update_state_data(uid, {"user_role": role})
         edit_text(cid, mid, "🩺 <b>የስፔሻሊቲ ዘርፍ ይምረጡ፦</b>", markup=SPECIALTIES_KB)
 
-    # ── Specialty → Doctors ──────────────────────────────────────────
+    # Specialty → Doctors
     elif data.startswith("dept_"):
         dept = data.split("_")[1]
         edit_text(cid, mid, "👨‍⚕️ <b>ስፔሻሊስት ይምረጡ፦</b>", markup=doctors_kb(dept))
 
-    # ── Doctor selected ──────────────────────────────────────────────
+    # Doctor selected
     elif data.startswith("select_doc_"):
         parts = data.split("_")
         did   = int(parts[2])
-        dname = "_".join(parts[3:])  # name may contain spaces encoded as _
+        dname = "_".join(parts[3:])
         edit_text(cid, mid,
                   f"👨‍⚕️ <b>{dname}</b>\n\nየምክክር አይነት ይምረጡ፦",
                   markup=call_type_kb(did, dname))
 
-    # ── Call type → payment ──────────────────────────────────────────
+    # Call type → payment
     elif data.startswith("call_"):
         parts  = data.split("_")
         did    = int(parts[1])
         ctype  = parts[2]
         price  = float(parts[3])
         dname  = "_".join(parts[4:])
-        s      = get_state(uid)
-        role   = s["data"].get("user_role", "Patient")
+        role   = get_state(uid)["data"].get("user_role", "Patient")
 
         if role == "GP":
             set_state(uid, "waiting_for_gp_case",
                       {"doctor_id": did, "doctor_name": dname,
                        "price": price, "call_type": ctype})
             send(cid,
-                 f"👨‍⚕️ <b>ለ {dname} ማማከር — Case Details</b>\n\n"
-                 "የካርድ/የታካሚ ታሪክ (Case Details) በአንድ መልእክት ጽፈው ይላኩ፦")
+                 f"👨‍⚕️ <b>ለ {dname} — Case Details</b>\n\n"
+                 "የካርድ/የታካሚ ታሪክ በአንድ መልእክት ጽፈው ይላኩ፦")
         else:
             set_state(uid, "waiting_for_receipt",
                       {"doctor_id": did, "doctor_name": dname,
@@ -606,29 +583,26 @@ def handle_callback(cb: dict):
                  "ክፍያ ቦታ፦\n"
                  "• <b>CBE:</b> <code>1000255631865</code> (Tazebachew Wudie)\n"
                  "• <b>Telebirr:</b> <code>0908343267</code>\n\n"
-                 "<b>ክፍያ ከፈጸሙ በኋላ ደረሰኙን (Screenshot) ይላኩ፦</b>")
+                 "<b>ደረሰኙን (Screenshot) ይላኩ፦</b>")
 
-    # ── Doctor registration start ────────────────────────────────────
+    # Doctor registration start
     elif data == "start_doc_reg":
         set_state(uid, "doc_reg_name", {})
-        send(cid,
-             "📝 <b>ዶክተር/ስፔሻሊስት ምዝገባ</b>\n\n"
-             "ሙሉ ስምዎን ያስገቡ (ምሳሌ: Dr. Abebe Kebede):")
+        send(cid, "📝 <b>ዶክተር ምዝገባ</b>\n\nሙሉ ስምዎን ያስገቡ (ምሳሌ: Dr. Abebe Kebede):")
 
-    # ── Education store ──────────────────────────────────────────────
+    # Education store
     elif data.startswith("store_dept_"):
         dept = data.split("_")[2]
         edit_text(cid, mid, "📚 <b>ምርጫዎን ያድርጉ፦</b>",
                   markup=digital_products_kb(dept))
 
     elif data.startswith("buy_prod_"):
-        parts     = data.split("_")
-        prod_name = parts[2]
-        prod_price= float(parts[3])
-        file_type = parts[4]
+        parts      = data.split("_")
+        prod_name  = parts[2]
+        prod_price = float(parts[3])
+        file_type  = parts[4]
         set_state(uid, "waiting_for_store_receipt",
-                  {"item_name": prod_name, "item_price": prod_price,
-                   "file_type": file_type})
+                  {"item_name": prod_name, "item_price": prod_price, "file_type": file_type})
         send(cid,
              f"📖 <b>{prod_name} ለመግዛት</b>\n\n"
              f"💳 <b>ዋጋ:</b> {prod_price} ETB\n\n"
@@ -637,7 +611,7 @@ def handle_callback(cb: dict):
              "• <b>Telebirr:</b> <code>0908343267</code>\n\n"
              "<b>ደረሰኙን ፎቶ ወይም ዶኩሜንት አድርጎ ይላኩ፦</b>")
 
-    # ── Premium channel ──────────────────────────────────────────────
+    # Premium channel
     elif data == "buy_premium_channel":
         set_state(uid, "waiting_for_premium_receipt", {})
         send(cid,
@@ -647,23 +621,17 @@ def handle_callback(cb: dict):
              "• <b>Telebirr:</b> <code>0908343267</code>\n\n"
              "<b>ደረሰኙን (Screenshot) ይላኩ፦</b>")
 
-    # ── Info ──────────────────────────────────────────────────────────
+    # Info
     elif data == "group_premium":
-        send(cid,
-             f"🔒 <b>ፕሪሚየም ቪዲዮ/ድምፅ ውይይት</b>\n\n"
-             f"ወርሃዊ ክፍያ: 150 ETB\nአድሚን: {SUPPORT_USERNAME}")
+        send(cid, f"🔒 <b>ፕሪሚየም ቪዲዮ/ድምፅ ውይይት</b>\n\nወርሃዊ ክፍያ: 150 ETB\nአድሚን: {SUPPORT_USERNAME}")
     elif data == "homecare_info":
-        send(cid,
-             f"🏠 <b>የቤት ለቤት ህክምና</b>\n\n"
-             f"📞 <code>{SUPPORT_PHONE_1}</code> / <code>{SUPPORT_PHONE_2}</code>")
+        send(cid, f"🏠 <b>የቤት ለቤት ህክምና</b>\n\n📞 <code>{SUPPORT_PHONE_1}</code> / <code>{SUPPORT_PHONE_2}</code>")
     elif data == "emergency_alert":
-        send(cid,
-             "🚨 <b>ድንገተኛ አደጋ</b>\n\nወደ አቅራቢያ ሆስፒታል ሄዱ!\n📞 <b>907</b> (ቀይ መስቀል)")
+        send(cid, "🚨 <b>ድንገተኛ አደጋ</b>\n\nወደ አቅራቢያ ሆስፒታል ሄዱ!\n📞 <b>907</b> (ቀይ መስቀል)")
 
-    # ── Admin: Approve consultation ──────────────────────────────────
-    elif data.startswith("approve_") and not data.startswith(("approve_prem_",
-                                                               "approve_doc_",
-                                                               "approve_store_")):
+    # Admin: Approve consultation
+    elif data.startswith("approve_") and not data.startswith(
+            ("approve_prem_", "approve_doc_", "approve_store_")):
         parts    = data.split("_")
         pat_id   = int(parts[1])
         doc_id   = int(parts[2])
@@ -683,37 +651,29 @@ def handle_callback(cb: dict):
                  markup=end_consultation_kb(doc_id))
             send(doc_id,
                  f"👨‍⚕️ <b>አዲስ ታካሚ ተመድቦልዎታል!</b>\n\n"
-                 f"👤 ታካሚ ID: <code>{pat_id}</code>\n"
-                 f"💬 ዓይነት: {ctype.upper()}",
+                 f"👤 ታካሚ ID: <code>{pat_id}</code>\n💬 ዓይነት: {ctype.upper()}",
                  markup=end_consultation_kb(pat_id))
         else:
             send(pat_id,
                  f"🔴 <b>{doc_name} አሁን Offline ናቸው።</b>\n\n"
-                 f"ሀኪሙ ሰዓቱን ሲያሳውቁ መልእክት ይደርስዎታል!")
+                 "ሀኪሙ ሰዓቱን ሲያሳውቁ መልእክት ይደርስዎታል!")
             send(doc_id,
                  f"🚨 <b>አዲስ ክፍያ ደርሷል!</b>\n\n"
-                 f"👤 ታካሚ ID: <code>{pat_id}</code>\n"
-                 f"📞 {ctype.upper()}\n\nሰዓቱን ይጠቁሙ:",
-                 markup=ik([btn("🕒 ሰዓት ለመወሰን",
-                                cb=f"set_time_{pat_id}_{ctype}")]))
+                 f"👤 ታካሚ ID: <code>{pat_id}</code>\n📞 {ctype.upper()}\n\nሰዓቱን ይጠቁሙ:",
+                 markup=ik([btn("🕒 ሰዓት ለመወሰን", cb=f"set_time_{pat_id}_{ctype}")]))
 
-        edit_caption(cid, mid,
-                     f"{cb['message'].get('caption','')}\n\n✅ <b>APPROVED</b>")
+        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>APPROVED</b>")
 
     elif data.startswith("approve_prem_"):
         pat_id = int(data.split("_")[2])
-        send(pat_id,
-             f"🎉 <b>ፕሪሚየም ክፍያዎ ጸድቋል!</b>\n\n🔗 {PREMIUM_CHANNEL}")
-        edit_caption(cid, mid,
-                     f"{cb['message'].get('caption','')}\n\n✅ PREMIUM APPROVED")
+        send(pat_id, f"🎉 <b>ፕሪሚየም ክፍያዎ ጸድቋል!</b>\n\n🔗 {PREMIUM_CHANNEL}")
+        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ PREMIUM APPROVED")
 
     elif data.startswith("approve_doc_"):
         doc_id = int(data.split("_")[2])
         send(doc_id,
-             "🎉 <b>ምዝገባዎ ጸድቋል!</b>\n\n"
-             "አሁን ከሲስተሙ ጋር ተቀላቅለዋል። ይቀጥሉ!")
-        edit_caption(cid, mid,
-                     f"{cb['message'].get('caption','')}\n\n✅ DOCTOR APPROVED")
+             "🎉 <b>ምዝገባዎ ጸድቋል!</b>\n\nአሁን ከሲስተሙ ጋር ተቀላቅለዋል።")
+        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ DOCTOR APPROVED")
 
     elif data.startswith("approve_store_"):
         parts     = data.split("_")
@@ -722,31 +682,24 @@ def handle_callback(cb: dict):
         price     = float(parts[4])
         item_name = "_".join(parts[5:]) if len(parts) > 5 else "Digital Product"
         record_transaction(0, "Admin", file_type.upper(), item_name, price, pat_id)
-        send(pat_id,
-             f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n\n"
-             f"{item_name} ({file_type.upper()}) ቶሎ ይደርስዎታል!")
-        edit_caption(cid, mid,
-                     f"{cb['message'].get('caption','')}\n\n✅ APPROVED")
+        send(pat_id, f"🎉 <b>ክፍያዎ ጸድቋል!</b>\n\n{item_name} ({file_type.upper()}) ቶሎ ይደርስዎታል!")
+        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ APPROVED")
 
     elif data.startswith("reject_"):
         pat_id = int(data.split("_")[1])
-        send(pat_id,
-             "❌ <b>ደረሰኝዎ ውድቅ ተደርጓል!</b>\n\n"
-             "ትክክለኛ ደረሰኝ ይላኩ ወይም አድሚን ያናግሩ።")
-        edit_caption(cid, mid,
-                     f"{cb['message'].get('caption','')}\n\n❌ REJECTED")
+        send(pat_id, "❌ <b>ደረሰኝዎ ውድቅ ተደርጓል!</b>\n\nትክክለኛ ደረሰኝ ይላኩ ወይም አድሚን ያናግሩ።")
+        edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n❌ REJECTED")
 
-    # ── Doctor scheduling ────────────────────────────────────────────
+    # Doctor scheduling
     elif data.startswith("set_time_"):
         parts  = data.split("_")
         pat_id = int(parts[2])
         ctype  = parts[3]
         set_state(uid, "doc_scheduling",
                   {"target_patient_id": pat_id, "scheduled_call_type": ctype})
-        send(cid,
-             "✍️ <b>ነፃ ሰዓቱን ይጻፉ (ምሳሌ: ነገ ከቀኑ 8:00):</b>")
+        send(cid, "✍️ <b>ነፃ ሰዓቱን ይጻፉ (ምሳሌ: ነገ ከቀኑ 8:00):</b>")
 
-    # ── End consultation ─────────────────────────────────────────────
+    # End consultation
     elif data.startswith("confirm_end_"):
         other = int(data.split("_")[2])
         send(cid, "⚠️ <b>ምክክሩን ማጠናቀቅ ይፈልጋሉ?</b>",
@@ -761,17 +714,13 @@ def handle_callback(cb: dict):
         end_session_state(uid, other)
         edit_text(cid, mid, "🔴 <b>ምክክሩ ተጠናቋል።</b> አመሰግናለን!")
         send(other, "🔴 <b>ምክክሩ ተጠናቋል።</b> አመሰግናለን!")
-        # Figure out who's the patient for rating
         uid_is_doc = is_doctor(uid)
         patient_id = other if uid_is_doc else uid
         doc_id2    = uid  if uid_is_doc else other
-        send(patient_id,
-             "⭐ <b>ሀኪምዎን አገልግሎት ይመዝኑ፦</b>",
-             markup=rating_kb(doc_id2))
-        set_state(patient_id, "waiting_for_rating",
-                  {"rating_doctor_id": doc_id2})
+        send(patient_id, "⭐ <b>ሀኪምዎን አገልግሎት ይመዝኑ፦</b>", markup=rating_kb(doc_id2))
+        set_state(patient_id, "waiting_for_rating", {"rating_doctor_id": doc_id2})
 
-    # ── Rating ───────────────────────────────────────────────────────
+    # Rating
     elif data.startswith("rate_"):
         parts   = data.split("_")
         score   = parts[1]
@@ -793,32 +742,28 @@ def handle_message(msg: dict):
     photo = msg.get("photo")
     doc   = msg.get("document")
 
-    # /start
     if text.startswith("/start"):
         parts   = text.split(" ", 1)
         payload = parts[1].strip() if len(parts) > 1 else ""
         handle_start(cid, user, payload)
         return
 
-    # /help
     if text.startswith("/help"):
         send(cid,
              f"📞 ስልክ: <code>{SUPPORT_PHONE_1}</code>\n"
              f"Telegram: {SUPPORT_USERNAME}")
         return
 
-    # Main menu text buttons
     for key, fn in MENU_HANDLERS.items():
         if text == key:
             fn(cid, user)
             return
 
-    # FSM
     fsm   = get_state(uid)
     state = fsm["state"]
     data  = fsm["data"]
 
-    # ── Payment receipt ──────────────────────────────────────────────
+    # Payment receipt
     if state == "waiting_for_receipt" and (photo or doc):
         doc_name = data.get("doctor_name", "Specialist")
         doc_id   = data.get("doctor_id", 0)
@@ -829,51 +774,43 @@ def handle_message(msg: dict):
             f"👨‍⚕️ ሀኪም: {doc_name} (<code>{doc_id}</code>)\n"
             f"💳 ክፍያ: {price} ETB"
         )
-        akb = admin_approve_kb(
-            f"approve_{uid}_{doc_id}_{price}_{doc_name}", uid)
-        for admin in ADMIN_IDS:
-            fid = photo[-1]["file_id"] if photo else doc["file_id"]
-            (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
+        fid = photo[-1]["file_id"] if photo else doc["file_id"]
+        notify_admin(fid, caption,
+                     admin_approve_kb(f"approve_{uid}_{doc_id}_{price}_{doc_name}", uid),
+                     is_photo=bool(photo))
         clear_state(uid)
-        send(cid,
-             "✅ ደረሰኝዎ ለአድሚን ተልኳል። ክፍያው ሲረጋገጥ ከሀኪሙ ጋር ይገናኛሉ።")
+        send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል። ክፍያው ሲረጋገጥ ከሀኪሙ ጋር ይገናኛሉ።")
         return
 
-    # ── GP Case details ──────────────────────────────────────────────
+    # GP Case details
     if state == "waiting_for_gp_case" and text:
         data["case_details"] = text
         set_state(uid, "waiting_for_gp_receipt", data)
         send(cid,
-             f"✅ <b>Case details ተመዝግቧል!</b>\n\n"
-             f"💳 ክፍያ: {data.get('price', 0)} ETB\n\n"
-             "ክፍያ ቦታ፦\n"
-             "• <b>CBE:</b> <code>1000255631865</code>\n"
-             "• <b>Telebirr:</b> <code>0908343267</code>\n\n"
-             "<b>ደረሰኙን ይላኩ፦</b>")
+             f"✅ <b>Case details ተመዝግቧል!</b>\n\n💳 ክፍያ: {data.get('price', 0)} ETB\n\n"
+             "ክፍያ ቦታ፦\n• <b>CBE:</b> <code>1000255631865</code>\n"
+             "• <b>Telebirr:</b> <code>0908343267</code>\n\n<b>ደረሰኙን ይላኩ፦</b>")
         return
 
     if state == "waiting_for_gp_receipt" and (photo or doc):
-        doc_name    = data.get("doctor_name", "Specialist")
-        doc_id      = data.get("doctor_id", 0)
-        price       = data.get("price", 0)
-        case_det    = data.get("case_details", "")
-        caption = (
+        doc_name = data.get("doctor_name", "Specialist")
+        doc_id   = data.get("doctor_id", 0)
+        price    = data.get("price", 0)
+        caption  = (
             f"🧾 <b>GP ማማከር ደረሰኝ!</b>\n\n"
             f"👤 GP: {user.get('first_name', '')} (<code>{uid}</code>)\n"
             f"👨‍⚕️ ስፔሻሊስት: {doc_name} (<code>{doc_id}</code>)\n"
-            f"💳 {price} ETB\n\n"
-            f"📝 Case Details:\n{case_det}"
+            f"💳 {price} ETB\n\n📝 Case:\n{data.get('case_details', '')}"
         )
-        akb = admin_approve_kb(
-            f"approve_{uid}_{doc_id}_{price}_{doc_name}", uid)
-        for admin in ADMIN_IDS:
-            fid = photo[-1]["file_id"] if photo else doc["file_id"]
-            (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
+        fid = photo[-1]["file_id"] if photo else doc["file_id"]
+        notify_admin(fid, caption,
+                     admin_approve_kb(f"approve_{uid}_{doc_id}_{price}_{doc_name}", uid),
+                     is_photo=bool(photo))
         clear_state(uid)
-        send(cid, "✅ ደረሰኝዎ ለአድሚን ተልኳል። ከስፔሻሊስቱ ጋር ይገናኛሉ።")
+        send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል። ከስፔሻሊስቱ ጋር ይገናኛሉ።")
         return
 
-    # ── Store receipt ────────────────────────────────────────────────
+    # Store receipt
     if state == "waiting_for_store_receipt" and (photo or doc):
         item_name  = data.get("item_name", "Product")
         item_price = data.get("item_price", 0)
@@ -881,34 +818,31 @@ def handle_message(msg: dict):
         caption = (
             f"🛒 <b>Digital Product ክፍያ!</b>\n\n"
             f"👤 ገዢ: {user.get('first_name', '')} (<code>{uid}</code>)\n"
-            f"📦 ምርት: {item_name} ({file_type.upper()})\n"
-            f"💳 {item_price} ETB"
+            f"📦 ምርት: {item_name} ({file_type.upper()})\n💳 {item_price} ETB"
         )
-        akb = admin_approve_kb(
-            f"approve_store_{uid}_{file_type}_{item_price}_{item_name}", uid)
-        for admin in ADMIN_IDS:
-            fid = photo[-1]["file_id"] if photo else doc["file_id"]
-            (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
+        fid = photo[-1]["file_id"] if photo else doc["file_id"]
+        notify_admin(fid, caption,
+                     admin_approve_kb(f"approve_store_{uid}_{file_type}_{item_price}_{item_name}", uid),
+                     is_photo=bool(photo))
         clear_state(uid)
-        send(cid, "✅ ደረሰኝዎ ለአድሚን ተልኳል። ፋይሉ ቶሎ ይደርስዎታል!")
+        send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል። ፋይሉ ቶሎ ይደርስዎታል!")
         return
 
-    # ── Premium receipt ──────────────────────────────────────────────
+    # Premium receipt
     if state == "waiting_for_premium_receipt" and (photo or doc):
         caption = (
             f"💎 <b>Premium Channel ክፍያ!</b>\n\n"
-            f"👤 {user.get('first_name', '')} (<code>{uid}</code>)\n"
-            f"💳 24 ETB/ወር"
+            f"👤 {user.get('first_name', '')} (<code>{uid}</code>)\n💳 24 ETB/ወር"
         )
-        akb = admin_approve_kb(f"approve_prem_{uid}", uid)
-        for admin in ADMIN_IDS:
-            fid = photo[-1]["file_id"] if photo else doc["file_id"]
-            (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
+        fid = photo[-1]["file_id"] if photo else doc["file_id"]
+        notify_admin(fid, caption,
+                     admin_approve_kb(f"approve_prem_{uid}", uid),
+                     is_photo=bool(photo))
         clear_state(uid)
-        send(cid, "✅ ደረሰኝዎ ለአድሚን ተልኳል! ቻናሉ ሊንክ ይደርስዎታል።")
+        send(cid, "✅ ደረሰኝዎ ለአድሚን ቡድን ተልኳል! ቻናሉ ሊንክ ይደርስዎታል።")
         return
 
-    # ── Doctor registration ──────────────────────────────────────────
+    # Doctor registration
     if state == "doc_reg_name" and text:
         set_state(uid, "doc_reg_specialty", {"reg_name": text})
         send(cid, "🩺 ስፔሻሊቲ ዘርፍዎን ያስገቡ (ምሳሌ: Internal Medicine):")
@@ -928,8 +862,7 @@ def handle_message(msg: dict):
         set_state(uid, "doc_reg_license", data)
         send(cid,
              "📄 የህክምና ፈቃድዎን (Professional License) ፎቶ ወይም Document ይላኩ፦\n\n"
-             "<b>ወይም ወደ ድረ-ገጻችን ሄደው ለዚያ ሙሉ ፎርም ምዝገባ ያድርጉ:</b>\n"
-             f"{WEBSITE_URL}")
+             f"<b>ወይም ሙሉ ምዝገባ ለማድረግ ወደ ድረ-ገጻችን ሄዱ:</b>\n{WEBSITE_URL}")
         return
     if state == "doc_reg_license" and (photo or doc):
         caption = (
@@ -940,22 +873,20 @@ def handle_message(msg: dict):
             f"🏥 ተቋም: {data.get('reg_institution')}\n"
             f"💳 ክፍያ: {data.get('reg_fee')} ETB"
         )
-        akb = admin_approve_kb(f"approve_doc_{uid}", uid)
-        for admin in ADMIN_IDS:
-            fid = photo[-1]["file_id"] if photo else doc["file_id"]
-            (fwd_photo if photo else fwd_doc)(admin, fid, caption, markup=akb)
+        fid = photo[-1]["file_id"] if photo else doc["file_id"]
+        notify_admin(fid, caption,
+                     admin_approve_kb(f"approve_doc_{uid}", uid),
+                     is_photo=bool(photo))
         clear_state(uid)
-        send(cid,
-             "✅ ምዝገባ ጥያቄዎ ለአድሚን ተልኳል! ሲጸድቅ ማሳወቂያ ይደርስዎታል!")
+        send(cid, "✅ ምዝገባ ጥያቄዎ ለአድሚን ቡድን ተልኳል! ሲጸድቅ ማሳወቂያ ይደርስዎታል!")
         return
 
-    # ── Doctor fee update ────────────────────────────────────────────
+    # Doctor fee update
     if state and state.startswith("setting_fee_") and text:
         fee_type = state.split("_")[2]
         try:
             new_fee = float(text.replace(" ETB", "").replace(",", "").strip())
-            if new_fee <= 0:
-                raise ValueError
+            if new_fee <= 0: raise ValueError
         except (ValueError, TypeError):
             send(cid, "❌ ትክክለኛ ቁጥር ያስገቡ (ምሳሌ: 150)")
             return
@@ -972,7 +903,7 @@ def handle_message(msg: dict):
              markup=MAIN_MENU)
         return
 
-    # ── Doctor scheduling ────────────────────────────────────────────
+    # Doctor scheduling
     if state == "doc_scheduling" and text:
         pat_id = data.get("target_patient_id")
         ctype  = data.get("scheduled_call_type", "")
@@ -980,13 +911,12 @@ def handle_message(msg: dict):
             send(int(pat_id),
                  f"🗓️ <b>ቀጠሮ ሰዓት ተቆርጧል!</b>\n\n"
                  f"👨‍⚕️ ሀኪም: {user.get('first_name', '')}\n"
-                 f"🕒 ሰዓት: {text}\n"
-                 f"📞 ዓይነት: {ctype.upper()}")
+                 f"🕒 ሰዓት: {text}\n📞 ዓይነት: {ctype.upper()}")
             send(cid, "✅ ሰዓቱ ለታካሚው ተልኳል!")
         clear_state(uid)
         return
 
-    # ── Feedback comment ─────────────────────────────────────────────
+    # Feedback
     if state == "waiting_for_feedback_comment" and text:
         doc_id2 = data.get("rating_doctor_id")
         score   = data.get("rating_score", "?")
@@ -997,17 +927,14 @@ def handle_message(msg: dict):
         send(cid, "🙏 ለሰጡን አስተያየት እናመሰግናለን! ጤና ይስጥልን።", markup=MAIN_MENU)
         return
 
-    # ── Active session relay ─────────────────────────────────────────
+    # Active session relay
     if state == "in_session":
         partner = data.get("partner_id")
         if partner:
             copy_msg(int(partner), cid, msg["message_id"])
         return
 
-    # ── Default ──────────────────────────────────────────────────────
-    send(cid,
-         "የተላከውን ማስተናገድ አልተቻለም። እባክዎ ከሜኑ ይምረጡ፦",
-         markup=MAIN_MENU)
+    send(cid, "የተላከውን ማስተናገድ አልተቻለም። ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
 
 
 # ── Update router ──────────────────────────────────────────────────
