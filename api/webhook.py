@@ -384,17 +384,29 @@ def get_doctors_list(dept: str = "") -> list:
 
 def is_doctor(uid: int) -> bool:
     try:
-        return bool(sb_get("public_doctor_profiles",
-                            f"telegram_id=eq.{uid}&select=telegram_id"))
-    except Exception:
+        # Check profiles table by telegram_id (matches doctor or admin role)
+        p_rows = sb_get("profiles", f"telegram_id=eq.{uid}&select=account_type")
+        if p_rows and isinstance(p_rows, list) and len(p_rows) > 0:
+            act = p_rows[0].get("account_type", "")
+            if act in ("doctor", "admin"):
+                return True
+        # Check public_doctor_profiles
+        d_rows = sb_get("public_doctor_profiles", f"telegram_id=eq.{uid}&select=telegram_id")
+        if d_rows and isinstance(d_rows, list) and len(d_rows) > 0:
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"is_doctor error: {e}")
         return False
 
 def get_doctor_name_by_tid(tid: int) -> str:
     try:
-        rows = sb_get("public_doctor_profiles",
-                      f"telegram_id=eq.{tid}&select=full_name")
-        if rows:
-            return rows[0].get("full_name", f"Doctor ({tid})")
+        prows = sb_get("profiles", f"telegram_id=eq.{tid}&select=full_name")
+        if prows and prows[0].get("full_name"):
+            return prows[0]["full_name"]
+        rows = sb_get("public_doctor_profiles", f"telegram_id=eq.{tid}&select=full_name")
+        if rows and rows[0].get("full_name"):
+            return rows[0]["full_name"]
     except Exception:
         pass
     return f"Doctor ({tid})"
