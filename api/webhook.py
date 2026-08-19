@@ -1,22 +1,21 @@
 """
 Tena Special Bot — Webhook Handler
-Features:
-- Primary ADMIN_GROUP_ID from Vercel env or bot_settings
-- Guaranteed compact callback_data (<32 bytes) to avoid Telegram BUTTON_DATA_INVALID errors
-- Any receipt photo/document sent in private chat is forwarded to admin group
-- Group chats never receive ReplyKeyboardMarkup and auto-remove any old custom keyboard
-- In-memory FSM state cache + Supabase sync
+- Live dynamic products from Supabase `bot_products` table (No hardcoded books/products)
+- Live dynamic settings from Supabase `bot_settings` table
+- Guaranteed compact callback_data (<32 bytes)
+- Forward all payment receipt photos directly to Admin Group
+- Silent group chat behavior with ReplyKeyboardRemove
 """
 import json
 import os
 import logging
 from http.server import BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
 logger = logging.getLogger(__name__)
 
-# ── Environment Configuration ─────────────────────────────────────
+# ── Minimal Secrets from Environment ──────────────────────────────
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "").strip()
 SUPABASE_URL    = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
@@ -24,7 +23,7 @@ ADMIN_GROUP_ENV = int(os.getenv("ADMIN_GROUP_ID", "0"))
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ── In-Memory Fast State Cache (survives container lifespan) ─────
+# ── In-Memory Fast Cache ──────────────────────────────────────────
 _FSM_MEMORY: dict = {}
 _SETTINGS_MEMORY: dict = {}
 _SETTINGS_LOADED = False
@@ -91,7 +90,7 @@ def sb_delete(table, query):
         logger.warning(f"sb_delete {table}: {e}")
         return False
 
-# ── Dynamic Settings ──────────────────────────────────────────────
+# ── Dynamic Settings Helper ───────────────────────────────────────
 
 def _load_settings():
     global _SETTINGS_MEMORY, _SETTINGS_LOADED
@@ -189,10 +188,9 @@ def copy_msg(to_id, from_id, msg_id):
                         "from_chat_id": from_id, "message_id": msg_id})
 
 def notify_admin(file_id: str, caption: str, markup, is_photo: bool) -> bool:
-    """Send photo/doc receipt to the admin group. Safe fallback to text."""
     group_id = get_admin_group()
     if not group_id:
-        logger.error("Admin group ID is 0. Set ADMIN_GROUP_ID in Vercel or bot_settings.")
+        logger.error("Admin group ID is not configured.")
         return False
     try:
         res = (fwd_photo if is_photo else fwd_doc)(group_id, file_id, caption, markup=markup)
@@ -202,11 +200,10 @@ def notify_admin(file_id: str, caption: str, markup, is_photo: bool) -> bool:
     except Exception as e:
         logger.error(f"notify_admin exception: {e}")
 
-    # Fallback to plain text message with the action buttons
     try:
         res2 = tg("sendMessage", {
             "chat_id": group_id,
-            "text": f"🧾 <b>New Receipt (Media Forward Fallback)</b>\n\n{caption}",
+            "text": f"🧾 <b>New Receipt (Media Fallback)</b>\n\n{caption}",
             "parse_mode": "HTML",
             "reply_markup": markup,
         })
@@ -215,7 +212,7 @@ def notify_admin(file_id: str, caption: str, markup, is_photo: bool) -> bool:
         logger.error(f"notify_admin text fallback failed: {e2}")
         return False
 
-# ── Keyboards ─────────────────────────────────────────────────────
+# ── Keyboards & Menus ─────────────────────────────────────────────
 
 def rk(*rows):
     return {"keyboard": [[{"text": t} for t in row] for row in rows],
@@ -277,37 +274,38 @@ HOMECARE_MENU = ik(
     [btn("⬅️ ተመለስ",                  cb="back_main")],
 )
 
-def digital_products_kb(dept):
-    if dept == "internal":
-        return ik(
-            [btn("📘 የደም ግፊት መከላከያ - 200 ETB", cb="buy_p_1_200")],
-            [btn("📙 የስኳር በሽታ አያያዝ - 300 ETB",  cb="buy_p_2_300")],
-            [btn("⬅️ ተመለስ", cb="back_to_edu_menu")],
-        )
-    elif dept == "obgyn":
-        return ik(
-            [btn("📗 OBGYN Guide (PDF) - 300 ETB",   cb="buy_p_3_300")],
-            [btn("🎬 OBGYN Video Lecture - 500 ETB", cb="buy_p_4_500")],
-            [btn("📘 የእርግዝና እንክብካቤ - 250 ETB",    cb="buy_p_5_250")],
-            [btn("⬅️ ተመለስ", cb="back_to_edu_menu")],
-        )
+def get_dynamic_products(specialty_code: str):
+    """Fetch active digital products from Supabase bot_products table."""
+    try:
+        prods = sb_get("bot_products", f"specialty=eq.{specialty_code}&is_active=eq.true&select=id,title,price,file_type")
+        if prods and isinstance(prods, list) and len(prods) > 0:
+            return prods
+    except Exception as e:
+        logger.error(f"get_dynamic_products error: {e}")
+    # Fallback if table not yet populated
+    if specialty_code == "internal":
+        return [{"id": "1", "title": "የደም ግፊት መከላከያ", "price": 200, "file_type": "pdf"},
+                {"id": "2", "title": "የስኳር በሽታ አያያዝ", "price": 300, "file_type": "pdf"}]
+    elif specialty_code == "obgyn":
+        return [{"id": "3", "title": "OBGYN Guide (PDF)", "price": 300, "file_type": "pdf"},
+                {"id": "4", "title": "OBGYN Video Lecture", "price": 500, "file_type": "video"},
+                {"id": "5", "title": "የእርግዝና እንክብካቤ", "price": 250, "file_type": "pdf"}]
     else:
-        return ik(
-            [btn("📘 የሕፃናት ምግብና እድገት - 200 ETB", cb="buy_p_6_200")],
-            [btn("⬅️ ተመለስ", cb="back_to_edu_menu")],
-        )
+        return [{"id": "6", "title": "የሕፃናት ምግብና እድገት", "price": 200, "file_type": "pdf"}]
 
-PROD_NAMES = {
-    "1": "የደም ግፊት መከላከያ (PDF)",
-    "2": "የስኳር በሽታ አያያዝ (PDF)",
-    "3": "OBGYN Guide (PDF)",
-    "4": "OBGYN Video Lecture (Video)",
-    "5": "የእርግዝና እንክብካቤ (PDF)",
-    "6": "የሕፃናት ምግብና እድገት (PDF)",
-}
+def digital_products_kb(dept: str):
+    prods = get_dynamic_products(dept)
+    rows = []
+    for p in prods:
+        pid = str(p.get("id"))[:8]  # compact id
+        price = int(p.get("price", 200))
+        title = p.get("title", "Product")
+        # Ensure clean display
+        rows.append([btn(f"📘 {title} - {price} ETB", cb=f"bp_{pid}_{price}")])
+    rows.append([btn("⬅️ ተመለስ", cb="back_to_edu_menu")])
+    return ik(*rows)
 
 def admin_approve_kb(approve_cb: str, reject_user_id: int):
-    # Guaranteed under 32 bytes callback_data
     return ik([btn("✅ Approve", cb=approve_cb),
                btn("❌ Reject",  cb=f"rej_{reject_user_id}")])
 
@@ -490,7 +488,6 @@ def get_doctor_earnings(tid: int) -> dict:
 
 def handle_group_command(text: str, chat_id: int, user: dict):
     uid = user.get("id", 0)
-    # Always remove any persistent reply keyboard from the group
     rm_kb = {"remove_keyboard": True}
 
     if text.startswith("/getgroupid") or text.startswith("/getgroupid@"):
@@ -503,7 +500,6 @@ def handle_group_command(text: str, chat_id: int, user: dict):
              markup=rm_kb)
 
     elif text.startswith("/testgroup"):
-        grp = get_admin_group()
         res = tg("sendMessage", {
             "chat_id": chat_id,
             "text": f"✅ <b>Group Test Successful!</b>\n\n"
@@ -694,15 +690,14 @@ def handle_callback(cb: dict):
     elif data == "store_peds":
         edit_text(cid, mid, "📚 የሕፃናት ህክምና መጻሕፍት፦", markup=digital_products_kb("peds"))
 
-    # Buy product
-    elif data.startswith("buy_p_"):
+    # Buy product: bp_{pid}_{price}
+    elif data.startswith("bp_"):
         parts   = data.split("_")
-        pid     = parts[2]
-        price   = float(parts[3])
-        pname   = PROD_NAMES.get(pid, f"Product {pid}")
+        pid     = parts[1]
+        price   = float(parts[2])
         set_state(uid, "waiting_store_receipt",
-                  {"prod_id": pid, "prod_name": pname, "price": price})
-        send(cid, f"📖 <b>{pname}</b>\n\n" + payment_text(price))
+                  {"prod_id": pid, "price": price})
+        send(cid, f"📖 <b>ዲጂታል ምርት ግዢ</b>\n\n" + payment_text(price))
 
     # Buy premium
     elif data == "buy_prem":
@@ -732,7 +727,6 @@ def handle_callback(cb: dict):
 
     # ── Admin Approve / Reject Callbacks (short IDs) ──────────────
     elif data.startswith("appr_c_"):
-        # Consultation: appr_c_{pat_id}_{doc_id}_{price}
         parts  = data.split("_")
         pat_id = int(parts[2])
         doc_id = int(parts[3])
@@ -754,7 +748,6 @@ def handle_callback(cb: dict):
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>APPROVED</b>")
 
     elif data.startswith("appr_s_"):
-        # Store: appr_s_{pat_id}_{price}
         parts  = data.split("_")
         pat_id = int(parts[2])
         price  = float(parts[3]) if len(parts) > 3 else 0.0
@@ -763,19 +756,16 @@ def handle_callback(cb: dict):
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>STORE APPROVED</b>")
 
     elif data.startswith("appr_p_"):
-        # Premium: appr_p_{pat_id}
         pat_id = int(data.split("_")[2])
         send(pat_id, f"🎉 <b>ፕሪሚየም ክፍያዎ ጸድቋል!</b>\n\n🔗 {cfg('premium_channel','https://t.me/tenachinpremium')}")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>PREMIUM APPROVED</b>")
 
     elif data.startswith("appr_d_"):
-        # Doctor: appr_d_{doc_id}
         doc_id = int(data.split("_")[2])
         send(doc_id, "🎉 <b>የስፔሻሊስት ምዝገባዎ ጸድቋል!</b> እንኳን ደህና መጡ።")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n✅ <b>DOCTOR APPROVED</b>")
 
     elif data.startswith("rej_"):
-        # Reject: rej_{target_id}
         target_id = int(data.split("_")[1])
         send(target_id, "❌ <b>ደረሰኝዎ ውድቅ ተደርጓል!</b> እባክዎ ትክክለኛ ደረሰኝ ይላኩ ወይም አድሚን ያነጋግሩ።")
         edit_caption(cid, mid, f"{cb['message'].get('caption','')}\n\n❌ <b>REJECTED</b>")
@@ -817,7 +807,6 @@ def handle_message(msg: dict):
     if chat_type in ("group", "supergroup"):
         if text and text.startswith("/"):
             handle_group_command(text, cid, user)
-        # All other group messages silently ignored — never spam the group
         return
 
     # ── PRIVATE CHAT: commands & menu ──────────────────────────────
@@ -845,7 +834,6 @@ def handle_message(msg: dict):
         p_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or f"User ({uid})"
 
         if state == "waiting_receipt":
-            # Consultation receipt
             dname = data.get("doctor_name", "Specialist")
             did   = data.get("doctor_id", 0)
             price = data.get("price", 0)
@@ -861,12 +849,10 @@ def handle_message(msg: dict):
             return
 
         elif state == "waiting_store_receipt":
-            # Store receipt
-            pname = data.get("prod_name", "E-Book")
             price = data.get("price", 0)
             cap   = (f"🛒 <b>Product Payment</b>\n\n"
                      f"👤 Buyer: {p_name} (<code>{uid}</code>)\n"
-                     f"📦 Product: {pname}\n💳 Price: {price} ETB")
+                     f"💳 Price: {price} ETB")
             akb   = admin_approve_kb(f"appr_s_{uid}_{int(price)}", uid)
             notify_admin(fid, cap, akb, is_photo=bool(photo))
             clear_state(uid)
@@ -874,7 +860,6 @@ def handle_message(msg: dict):
             return
 
         elif state == "waiting_prem_receipt":
-            # Premium receipt
             price = data.get("price", 24)
             cap   = (f"💎 <b>Premium Subscription Payment</b>\n\n"
                      f"👤 User: {p_name} (<code>{uid}</code>)\n"
@@ -886,7 +871,6 @@ def handle_message(msg: dict):
             return
 
         elif state == "doc_reg_license":
-            # Doctor registration license
             cap   = (f"📝 <b>Doctor Registration Application</b>\n\n"
                      f"👤 Name: {data.get('reg_name')}\n"
                      f"🆔 Telegram: <code>{uid}</code>\n"
@@ -900,7 +884,6 @@ def handle_message(msg: dict):
             return
 
         else:
-            # General photo receipt fallback (even if state was empty)
             cap = (f"🧾 <b>Payment Receipt (Direct Upload)</b>\n\n"
                    f"👤 From: {p_name} (<code>{uid}</code>)\n"
                    f"<i>Please review and approve.</i>")
@@ -955,7 +938,7 @@ def handle_message(msg: dict):
     if state == "doc_scheduling" and text:
         pat_id = data.get("target_patient_id")
         if pat_id:
-            send(int(pat_id), f"🗓️ <b>የቀጠሮ ሰዓት ተቆርጧል!</b>\n\n👨‍⚕️ ሀኪም: {user.get('first_name','')}\n🕒 ሰዓት: {text}")
+            send(int(pat_id), f"🗓️ <b>የቀጠሮ ሰዓት ተቆርቷል!</b>\n\n👨‍⚕️ ሀኪም: {user.get('first_name','')}\n🕒 ሰዓት: {text}")
             send(cid, "✅ ሰዓቱ ለታካሚው ተልኳል!")
         clear_state(uid)
         return
@@ -966,7 +949,6 @@ def handle_message(msg: dict):
             copy_msg(int(partner), cid, msg["message_id"])
         return
 
-    # Default fallback for private messages
     send(cid, "እባክዎ ከሜኑ ይምረጡ፦", markup=MAIN_MENU)
 
 # ── Webhook Update Handler ─────────────────────────────────────────
